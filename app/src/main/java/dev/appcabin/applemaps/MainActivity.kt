@@ -349,16 +349,10 @@ fun AppleMapsScreen(
     ) { innerPadding ->
         // ===== MAP fills behind the sheet =====
         Box(modifier = Modifier.fillMaxSize()) {
-            AppleMapView(
+            NativeMapComposable(
                 modifier = Modifier.fillMaxSize(),
-                auth = auth,
-                client = client,
-                tileCache = tileCache,
-                mapStyle = mapStyle,
                 center = mapCenter,
                 zoom = mapZoom,
-                userLocation = userLocation,
-                searchPin = searchPin,
                 onMapMoved = { center, zoom ->
                     mapCenter = center
                     mapZoom = zoom

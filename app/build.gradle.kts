@@ -63,6 +63,9 @@ dependencies {
     // Location
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
+    // MapLibre for vector tile rendering
+    implementation("org.maplibre.gl:android-sdk:11.8.4")
+
     // ---- Testing ----
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
