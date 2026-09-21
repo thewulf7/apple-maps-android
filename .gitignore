@@ -1,0 +1,19 @@
+# Gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# APK
+*.apk
+
+# Misc
+captures/
+.externalNativeBuild/
+.cxx/
+node_modules/
