@@ -63,10 +63,19 @@ class NativeMapView(context: Context) {
                     PropertyFactory.fillOpacity(0.7f),
                     PropertyFactory.fillOutlineColor("#D1C7BB"),
                 ))
-                // Road network — dark gray lines
-                style.addLayer(LineLayer("l-line", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#8C8C8C"),
-                    PropertyFactory.lineWidth(1.2f),
+                // Road network — Apple Maps style cased roads
+                // ponytail: feature types uncracked, single style for all roads
+                // Casing (dark outline)
+                style.addLayer(LineLayer("l-road-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#C0C0C0"),
+                    PropertyFactory.lineWidth(2.5f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ))
+                // Fill (white)
+                style.addLayer(LineLayer("l-road-fill", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#FFFFFF"),
+                    PropertyFactory.lineWidth(1.8f),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ))
