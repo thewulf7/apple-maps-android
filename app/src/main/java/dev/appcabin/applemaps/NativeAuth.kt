@@ -46,9 +46,15 @@ object NativeAuth {
         return "$url${sep}sid=$sessionId&accessKey=${ts}_${p3}_$encoded"
     }
 
-    /** Standard vector map tile URL (VMP4 format) — style 1 = road overlay with full geometry */
-    fun vectorTileUrl(z: Int, x: Int, y: Int, style: Int = 1, version: Int = 20028707): String {
-        val base = "https://gspe19-ssl.ls.apple.com/tile.vf?flags=8&style=$style&size=2&scale=0&v=$version&z=$z&x=$x&y=$y"
+    /** Standard vector map tile URL (VMP4 format)
+     *  style 1  → flags=8, v=20028707 (polygons + sparse roads)
+     *  style 20 → no flags, v=20027943 (dense road network overlay)
+     */
+    fun vectorTileUrl(z: Int, x: Int, y: Int, style: Int = 1): String {
+        val base = when (style) {
+            20 -> "https://gspe19-ssl.ls.apple.com/tile.vf?style=20&size=2&scale=0&v=20027943&z=$z&x=$x&y=$y"
+            else -> "https://gspe19-ssl.ls.apple.com/tile.vf?flags=8&style=$style&size=2&scale=0&v=20028707&z=$z&x=$x&y=$y"
+        }
         return signUrl(base)
     }
 

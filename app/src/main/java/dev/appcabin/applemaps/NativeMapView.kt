@@ -14,6 +14,7 @@ import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapLibreMapOptions
 import org.maplibre.android.maps.Style
+import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.*
 import org.maplibre.android.style.sources.GeoJsonSource
 import dev.appcabin.applemaps.vmp4.*
@@ -57,11 +58,49 @@ class NativeMapView(context: Context) {
                 style.addSource(GeoJsonSource(SRC_LINE))
                 style.addSource(GeoJsonSource(SRC_POINT))
 
-                // Polygon fill — light building/landuse polygons
-                style.addLayer(FillLayer("l-poly", SRC_POLY).withProperties(
-                    PropertyFactory.fillColor("#E8E0D8"),
-                    PropertyFactory.fillOpacity(0.7f),
-                    PropertyFactory.fillOutlineColor("#D1C7BB"),
+                // Polygon fills — Apple Maps color palette by feature type
+                // ponytail: separate sources per feature class beats data-driven for clarity
+                // ft=0: land/ground, ft=64-69: parks/recreation, ft=90-99: water
+                // Base land fill (covers everything)
+                style.addLayer(FillLayer("l-land", SRC_POLY).withProperties(
+                    PropertyFactory.fillColor("#F2EFE9"),
+                    PropertyFactory.fillOpacity(1.0f),
+                ))
+                // Parks — green (ft=64, 65 observed in Prague tiles)
+                style.addLayer(FillLayer("l-park", SRC_POLY).withProperties(
+                    PropertyFactory.fillColor("#D4E8C2"),
+                    PropertyFactory.fillOpacity(1.0f),
+                ).withFilter(
+                    Expression.any(
+                        Expression.eq(Expression.get("ft"), Expression.literal(64)),
+                        Expression.eq(Expression.get("ft"), Expression.literal(65)),
+                        Expression.eq(Expression.get("ft"), Expression.literal(40)),
+                    )
+                ))
+                // Water — blue (ft=97 likely, also range 88-100)
+                style.addLayer(FillLayer("l-water", SRC_POLY).withProperties(
+                    PropertyFactory.fillColor("#A8D4F0"),
+                    PropertyFactory.fillOpacity(1.0f),
+                ).withFilter(
+                    Expression.any(
+                        Expression.eq(Expression.get("ft"), Expression.literal(97)),
+                        Expression.eq(Expression.get("ft"), Expression.literal(94)),
+                        Expression.all(
+                            Expression.gte(Expression.get("ft"), Expression.literal(88)),
+                            Expression.lte(Expression.get("ft"), Expression.literal(100)),
+                        )
+                    )
+                ))
+                // Buildings — warm beige
+                style.addLayer(FillLayer("l-building", SRC_POLY).withProperties(
+                    PropertyFactory.fillColor("#E0D8CC"),
+                    PropertyFactory.fillOpacity(1.0f),
+                    PropertyFactory.fillOutlineColor("#C8C0B4"),
+                ).withFilter(
+                    Expression.all(
+                        Expression.gte(Expression.get("ft"), Expression.literal(100)),
+                        Expression.lte(Expression.get("ft"), Expression.literal(130)),
+                    )
                 ))
                 // Road network — Apple Maps style cased roads
                 // ponytail: feature types uncracked, single style for all roads
@@ -133,16 +172,10 @@ class NativeMapView(context: Context) {
             val results = mutableListOf<TileResult>()
             val jobs = mutableListOf<Deferred<TileResult?>>()
 
-            // Fetch optimal style mix per zoom level:
-            // - Style 1 (buildings/polygons): rich at z≤14, empty at z>14
-            // - Style 13 (standard vector map): sparse at z=14, good at z=15
-            // - Style 20 (road network): rich at z=14-15, empty at z>15
-            val styles = when {
-                zoom <= 13 -> listOf(1, 20)      // road overlay + satellite roads
-                zoom == 14 -> listOf(1, 20)      // best polygon + road data
-                zoom == 15 -> listOf(13, 20)     // standard map + satellite roads
-                else -> listOf(13)               // standard map only at z16+
-            }
+            // Style 1 = base polygons (land use, buildings) + sparse roads  
+            // Style 20 = dense road network overlay
+            // ponytail: only these two are confirmed working on gspe19-ssl
+            val styles = listOf(1, 20)
 
             for (x in xMin..xMax) for (y in yMin..yMax) {
                 val tx = x; val ty = y
@@ -159,12 +192,13 @@ class NativeMapView(context: Context) {
 
             for (tile in results) {
                 val (tx, ty, parsed) = tile
-                // Polygons
+                // Polygons — emit feature type as "ft" for color filtering
                 parsed.polygonVertices?.let { pool ->
                     for (i in pool.shapeStarts.indices) {
                         val start = pool.shapeStarts[i]
                         val len = pool.shapeLengths[i]
                         if (len < 3 || start + len > pool.vertices.size) continue
+                        val ft = if (i < parsed.polygons.size) parsed.polygons[i].featureType else 0
                         if (!pf) polySb.append(','); pf = false
                         polySb.append("""{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[""")
                         for (j in 0 until len) {
@@ -172,8 +206,7 @@ class NativeMapView(context: Context) {
                             appendCoord(polySb, pool.vertices[start + j], tx, ty, zoom)
                         }
                         polySb.append(','); appendCoord(polySb, pool.vertices[start], tx, ty, zoom)
-                        polySb.append("""]]},""")
-                        polySb.append(""""properties":{}}""")
+                        polySb.append("""]]},"properties":{"ft":$ft}}""")
                     }
                 }
                 // Lines
@@ -229,7 +262,9 @@ class NativeMapView(context: Context) {
                 null
             } else {
                 val parsed = parseTile(bytes)
-                Log.d(TAG, "Tile $key: polyShapes=${parsed.polygonVertices?.shapeStarts?.size ?: 0} lineShapes=${parsed.lineVertices?.shapeStarts?.size ?: 0} pointVerts=${parsed.pointVertices?.vertices?.size ?: 0}")
+                val polyTypes = parsed.polygons.take(20).map { it.featureType }
+                val lineTypes = parsed.lines.take(10).map { it.featureType }
+                Log.d(TAG, "Tile $key: polyShapes=${parsed.polygonVertices?.shapeStarts?.size ?: 0} polyTypes=$polyTypes lineShapes=${parsed.lineVertices?.shapeStarts?.size ?: 0} lineTypes=$lineTypes")
                 synchronized(tileCache) { tileCache[key] = parsed }
                 parsed
             }
