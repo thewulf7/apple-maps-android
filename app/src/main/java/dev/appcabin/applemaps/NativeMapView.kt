@@ -124,12 +124,22 @@ class NativeMapView(context: Context) {
             val results = mutableListOf<TileResult>()
             val jobs = mutableListOf<Deferred<TileResult?>>()
 
+            // Fetch optimal style mix per zoom level:
+            // - Style 1 (buildings/polygons): rich at z≤14, empty at z>14
+            // - Style 13 (standard vector map): sparse at z=14, good at z=15
+            // - Style 20 (road network): rich at z=14-15, empty at z>15
+            val styles = when {
+                zoom <= 13 -> listOf(1, 20)      // road overlay + satellite roads
+                zoom == 14 -> listOf(1, 20)      // best polygon + road data
+                zoom == 15 -> listOf(13, 20)     // standard map + satellite roads
+                else -> listOf(13)               // standard map only at z16+
+            }
+
             for (x in xMin..xMax) for (y in yMin..yMax) {
                 val tx = x; val ty = y
-                // Style 1: buildings + some roads
-                jobs.add(async { fetchAndParse(zoom, tx, ty, style = 1)?.let { TileResult(tx, ty, it) } })
-                // Style 20: road network for satellite (has dense line data)
-                jobs.add(async { fetchAndParse(zoom, tx, ty, style = 20)?.let { TileResult(tx, ty, it) } })
+                for (style in styles) {
+                    jobs.add(async { fetchAndParse(zoom, tx, ty, style = style)?.let { TileResult(tx, ty, it) } })
+                }
             }
             jobs.mapNotNull { it.await() }.let { results.addAll(it) }
 
