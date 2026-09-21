@@ -128,6 +128,20 @@ class ChapterReader(private val data: ByteArray) {
         }
     }
 
+    /** Read varint up to 64 bits — for fields that may contain 9-byte hash values. Returns low 32 bits. */
+    fun readVarUint64Low32(): Int {
+        var result = 0L
+        var shift = 0
+        while (true) {
+            if (pos >= data.size) throw IllegalStateException("EOF in varint")
+            val b = data[pos++].toLong() and 0xFF
+            if (shift < 63) result = result or ((b and 0x7F) shl shift)
+            if (b and 0x80 == 0L) return result.toInt()
+            shift += 7
+            if (shift >= 70) throw IllegalStateException("Varint overflow")
+        }
+    }
+
     fun toBitStream() = BitStream(data, pos * 8)
 }
 
@@ -189,6 +203,8 @@ fun decodeVertices(section: Vmp4Section): VertexPool? {
     val runBits = bs.readBits(4)
     val hasCurves = bs.readBit()
 
+    android.util.Log.d("VMP4Verts", "decodeVertices: sc=$shapeCount vc=$vertexCount coordBits=$coordBits deltaBits=$deltaBits runBits=$runBits hasCurves=$hasCurves")
+
     val scale = 1.0f / ((1 shl coordBits) - 1).toFloat()
     val verts = mutableListOf<Vertex>()
     val starts = mutableListOf<Int>()
@@ -217,7 +233,12 @@ fun decodeVertices(section: Vmp4Section): VertexPool? {
         remaining -= runLen
     }
 
-    return VertexPool(coordBits, verts, starts, lengths)
+    return VertexPool(coordBits, verts, starts, lengths).also {
+        if (verts.isNotEmpty()) {
+            val v0 = verts[0]
+            android.util.Log.d("VMP4Verts", "First vertex: raw=(${(v0.x / (1.0f/((1 shl coordBits)-1))).toInt()},${(v0.y / (1.0f/((1 shl coordBits)-1))).toInt()}) norm=(${v0.x},${v0.y})")
+        }
+    }
 }
 
 // ── Feature decoding ───────────────────────────────────────────────────
@@ -251,7 +272,7 @@ fun decodePolygonFeatures(section: Vmp4Section): List<PolygonFeature> {
     val count = try { r.readVarUint32() } catch (_: Exception) { return emptyList() }
     return (0 until count).mapNotNull {
         try {
-            PolygonFeature(r.readVarUint32(), r.readVarUint32(), r.readVarUint32(), r.readVarUint32(), r.readVarUint32())
+            PolygonFeature(r.readVarUint64Low32(), r.readVarUint64Low32(), r.readVarUint64Low32(), r.readVarUint64Low32(), r.readVarUint64Low32())
         } catch (_: Exception) { null }
     }
 }

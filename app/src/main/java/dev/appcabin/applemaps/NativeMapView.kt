@@ -27,7 +27,7 @@ import kotlin.math.pow
  * ponytail: fetches style 1 (buildings/polygons) + style 20 (road network)
  * and merges them into a single render.
  */
-class NativeMapView(context: Context) {
+class NativeMapView(private val context: Context) {
 
     companion object {
         private const val TAG = "NativeMapView"
@@ -66,30 +66,20 @@ class NativeMapView(context: Context) {
                     PropertyFactory.fillColor("#F2EFE9"),
                     PropertyFactory.fillOpacity(1.0f),
                 ))
-                // Parks — green (ft=64, 65 observed in Prague tiles)
+                // Parks — green
+                // Use Expression.raw() — Expression.literal(int) type-mismatches JSON double ft values
                 style.addLayer(FillLayer("l-park", SRC_POLY).withProperties(
                     PropertyFactory.fillColor("#D4E8C2"),
                     PropertyFactory.fillOpacity(1.0f),
                 ).withFilter(
-                    Expression.any(
-                        Expression.eq(Expression.get("ft"), Expression.literal(64)),
-                        Expression.eq(Expression.get("ft"), Expression.literal(65)),
-                        Expression.eq(Expression.get("ft"), Expression.literal(40)),
-                    )
+                    Expression.raw("[\"in\",[\"get\",\"ft\"],[\"literal\",[40,64,65]]]")
                 ))
-                // Water — blue (ft=97 likely, also range 88-100)
+                // Water — blue
                 style.addLayer(FillLayer("l-water", SRC_POLY).withProperties(
                     PropertyFactory.fillColor("#A8D4F0"),
                     PropertyFactory.fillOpacity(1.0f),
                 ).withFilter(
-                    Expression.any(
-                        Expression.eq(Expression.get("ft"), Expression.literal(97)),
-                        Expression.eq(Expression.get("ft"), Expression.literal(94)),
-                        Expression.all(
-                            Expression.gte(Expression.get("ft"), Expression.literal(88)),
-                            Expression.lte(Expression.get("ft"), Expression.literal(100)),
-                        )
-                    )
+                    Expression.raw("[\"in\",[\"get\",\"ft\"],[\"literal\",[88,89,90,91,92,93,94,95,96,97,98,99,100]]]")
                 ))
                 // Buildings — warm beige
                 style.addLayer(FillLayer("l-building", SRC_POLY).withProperties(
@@ -97,10 +87,7 @@ class NativeMapView(context: Context) {
                     PropertyFactory.fillOpacity(1.0f),
                     PropertyFactory.fillOutlineColor("#C8C0B4"),
                 ).withFilter(
-                    Expression.all(
-                        Expression.gte(Expression.get("ft"), Expression.literal(100)),
-                        Expression.lte(Expression.get("ft"), Expression.literal(130)),
-                    )
+                    Expression.raw("[\"all\",[\">\", [\"get\",\"ft\"], 99],[\"<\",[\"get\",\"ft\"],131]]")
                 ))
                 // Road network — Apple Maps style cased roads
                 // ponytail: feature types uncracked, single style for all roads
@@ -127,7 +114,7 @@ class NativeMapView(context: Context) {
                 ))
 
                 mlMap.cameraPosition = CameraPosition.Builder()
-                    .target(LatLng(50.08, 14.42)).zoom(14.0).build()
+                    .target(LatLng(50.0853, 14.4031)).zoom(14.0).build()
 
                 mlMap.addOnCameraIdleListener { loadVisibleTiles() }
                 loadVisibleTiles()
@@ -193,12 +180,40 @@ class NativeMapView(context: Context) {
             for (tile in results) {
                 val (tx, ty, parsed) = tile
                 // Polygons — emit feature type as "ft" for color filtering
+                // ponytail: build shape→ft map from class ranges once, reuse per shape
                 parsed.polygonVertices?.let { pool ->
+                    val shapeCount = pool.shapeStarts.size
+                    val shapeFt = IntArray(shapeCount)
+                    // Classes assign ft to shape ranges via vertexStart..vertexStart+outerCount
+                    // Some class fields are corrupt (hash bytes read as varints) — clamp defensively
+                    for (cls in parsed.polygons) {
+                        val ft = cls.featureType
+                        Log.d(TAG, "rawcls: vs=${cls.vertexStart} oc=${cls.outerCount} hc=${cls.holeCount} ft=$ft si=${cls.styleIndex}")
+                        // Skip garbage (hash bytes misread as varint → huge) and land default (0)
+                        if (ft <= 0 || ft > 127) continue
+                        val s = cls.vertexStart.coerceIn(0, shapeCount - 1)
+                        val n = cls.outerCount.coerceIn(0, shapeCount)
+                        val e = (s + n).coerceAtMost(shapeCount)
+                        if (e > s) for (k in s until e) shapeFt[k] = ft
+                    }
+                    Log.d(TAG, "shapeFt sample: ${shapeFt.take(20).toList()} nonzero=${shapeFt.count { it != 0 }}")
+                    // Count ft distribution
+                    val ftDist = shapeFt.groupBy { it }.mapValues { it.value.size }
+                    Log.d(TAG, "shapeFt distribution: $ftDist")
+                    // Log first polygon coords for debugging
+                    if (pool.shapeStarts.isNotEmpty()) {
+                        val s0 = pool.shapeStarts[0]; val l0 = pool.shapeLengths[0]
+                        if (l0 > 0) {
+                            val v0 = pool.vertices[s0]
+                            val (lon0, lat0) = tileToWgs84(tx, ty, zoom, v0.x, v0.y)
+                            Log.d(TAG, "Tile $tx/$ty/$zoom poly[0] v0: raw=(${v0.x},${v0.y}) wgs84=($lat0,$lon0)")
+                        }
+                    }
                     for (i in pool.shapeStarts.indices) {
                         val start = pool.shapeStarts[i]
                         val len = pool.shapeLengths[i]
                         if (len < 3 || start + len > pool.vertices.size) continue
-                        val ft = if (i < parsed.polygons.size) parsed.polygons[i].featureType else 0
+                        val ft = shapeFt[i]
                         if (!pf) polySb.append(','); pf = false
                         polySb.append("""{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[""")
                         for (j in 0 until len) {
@@ -245,7 +260,14 @@ class NativeMapView(context: Context) {
                     (s.getSource(SRC_POLY) as? GeoJsonSource)?.setGeoJson(polyJson)
                     (s.getSource(SRC_LINE) as? GeoJsonSource)?.setGeoJson(lineJson)
                     (s.getSource(SRC_POINT) as? GeoJsonSource)?.setGeoJson(pointJson)
-                    Log.d(TAG, "Updated map: poly=${polyJson.length}, line=${lineJson.length}, point=${pointJson.length} chars")
+                    Log.d(TAG, "Updated map: poly=${polySb.length}, line=${lineSb.length}, point=${pointSb.length} chars")
+                    // Log a sample of poly GeoJSON for debug
+                    val polyStr = polySb.toString()
+                    val ft64idx = polyStr.indexOf("\"ft\":64")
+                    val ft65idx = polyStr.indexOf("\"ft\":65")
+                    val ft94idx = polyStr.indexOf("\"ft\":94")
+                    Log.d(TAG, "ft64 first at char $ft64idx, ft65 at $ft65idx, ft94 at $ft94idx")
+                    if (ft64idx > 0) Log.d(TAG, "ft64 context: ...${polyStr.substring((ft64idx-20).coerceAtLeast(0), (ft64idx+50).coerceAtMost(polyStr.length))}")
                 }
             }
         }
@@ -255,8 +277,16 @@ class NativeMapView(context: Context) {
         val key = "$z/$x/$y/s$style"
         synchronized(tileCache) { tileCache[key] }?.let { return it }
         return try {
-            val url = NativeAuth.vectorTileUrl(z, x, y, style = style)
-            val bytes = client.get(url).bodyAsBytes()
+            // Try asset fallback first (for offline testing)
+            val assetName = "tile_${z}_${x}_${y}_s${style}.bin"
+            val bytes: ByteArray = try {
+                context.assets.open(assetName).readBytes().also {
+                    Log.d(TAG, "Tile $key: loaded from asset $assetName (${it.size}b)")
+                }
+            } catch (_: Exception) {
+                val url = NativeAuth.vectorTileUrl(z, x, y, style = style)
+                client.get(url).bodyAsBytes()
+            }
             if (bytes.size < 8 || bytes[0] != 'V'.code.toByte()) {
                 Log.w(TAG, "Tile $key: not VMP4, ${bytes.size}b")
                 null
