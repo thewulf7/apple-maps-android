@@ -7,14 +7,14 @@ plugins {
 
 android {
     namespace = "dev.appcabin.applemaps"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "dev.appcabin.applemaps"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.5.0"
+        versionCode = 3
+        versionName = "0.6.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -40,6 +40,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.10.1")
 
     // Networking
@@ -63,11 +64,9 @@ dependencies {
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
     // ---- Testing ----
-    // Unit tests (JVM)
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
 
-    // Instrumented tests (on device)
     androidTestImplementation(composeBom)
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
