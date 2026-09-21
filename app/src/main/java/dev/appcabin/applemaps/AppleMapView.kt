@@ -9,7 +9,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.input.pointer.pointerInput
 import io.ktor.client.*
 import io.ktor.client.request.*
@@ -64,7 +63,19 @@ fun AppleMapView(
     searchPin: LatLng? = null,
     onMapMoved: (LatLng, Float) -> Unit = { _, _ -> },
 ) {
-    // Compose-observable tile state: maps key -> ImageBitmap (or null = loading)
+    // === Internal gesture state — written directly by pointer handler ===
+    // These are the SOURCE OF TRUTH during gestures. The parent's center/zoom
+    // are treated as "external commands" (search nav, GPS button).
+    var internalCenter by remember { mutableStateOf(center) }
+    var internalZoom by remember { mutableStateOf(zoom) }
+
+    // Sync external → internal when parent programmatically navigates
+    // (search result tap, GPS button, zoom +/- buttons)
+    LaunchedEffect(center, zoom) {
+        internalCenter = center
+        internalZoom = zoom
+    }
+
     val visibleTiles = remember { mutableStateMapOf<String, ImageBitmap?>() }
     val loadingKeys = remember { mutableSetOf<String>() }
     val scope = rememberCoroutineScope()
@@ -81,7 +92,6 @@ fun AppleMapView(
     }
 
     fun loadTile(key: String, style: String, x: Int, y: Int, z: Int) {
-        // Fast path: already in compose state
         if (visibleTiles.containsKey(key)) return
         synchronized(loadingKeys) {
             if (loadingKeys.contains(key)) return
@@ -89,19 +99,16 @@ fun AppleMapView(
         }
         scope.launch(Dispatchers.IO) {
             try {
-                // Check disk cache first
                 val cached = tileCache.get(key)
                 if (cached != null) {
                     visibleTiles[key] = cached
                     return@launch
                 }
-                // Fetch from network
                 val url = auth.tileUrl(style, x, y, z)
                 val bytes = client.get(url) {
                     header("Origin", "https://duckduckgo.com")
                     header("Referer", "https://duckduckgo.com/")
                 }.readRawBytes()
-                // Store in cache (disk + memory)
                 val img = tileCache.put(key, bytes)
                 if (img != null) {
                     visibleTiles[key] = img
@@ -121,25 +128,36 @@ fun AppleMapView(
             .fillMaxSize()
             .pointerInput(Unit) {
                 detectTransformGestures { _, pan, gestureZoom, _ ->
-                    val z = zoom.toInt()
-                    val (cx, cy) = latLngToTile(center.lat, center.lng, z)
+                    // Read current internal state (always fresh — mutableStateOf)
+                    val curCenter = internalCenter
+                    val curZoom = internalZoom
+
+                    val z = curZoom.toInt()
+                    val (cx, cy) = latLngToTile(curCenter.lat, curCenter.lng, z)
                     val newCx = cx - pan.x / tileSize
                     val newCy = cy - pan.y / tileSize
                     val newCenter = tileToLatLng(newCx, newCy, z)
 
-                    val newZoom = (zoom + ln(gestureZoom.toDouble()).toFloat() / ln(2.0f))
+                    val newZoom = (curZoom + ln(gestureZoom.toDouble()).toFloat() / ln(2.0f))
                         .coerceIn(2f, 19f)
 
+                    // Update internal state immediately (next gesture frame sees it)
+                    internalCenter = newCenter
+                    internalZoom = newZoom
+
+                    // Notify parent
                     onMapMoved(newCenter, newZoom)
                 }
             }
     ) {
         val viewW = size.width
         val viewH = size.height
-        val z = zoom.toInt()
+        val curCenter = internalCenter
+        val curZoom = internalZoom
+        val z = curZoom.toInt()
         val n = 1 shl z
 
-        val (cx, cy) = latLngToTile(center.lat, center.lng, z)
+        val (cx, cy) = latLngToTile(curCenter.lat, curCenter.lng, z)
 
         val tilesX = ceil(viewW / tileSize).toInt() + 2
         val tilesY = ceil(viewH / tileSize).toInt() + 2
@@ -177,54 +195,19 @@ fun AppleMapView(
 
         // Draw user location dot
         if (userLocation != null) {
-            val pos = latLngToPixel(userLocation, center, z, tileSize, viewW, viewH)
-            // Accuracy circle
-            drawCircle(
-                color = Color(0x30007AFF),
-                radius = 40f,
-                center = pos,
-            )
-            // White border
-            drawCircle(
-                color = Color.White,
-                radius = 12f,
-                center = pos,
-            )
-            // Blue dot
-            drawCircle(
-                color = Color(0xFF007AFF),
-                radius = 9f,
-                center = pos,
-            )
+            val pos = latLngToPixel(userLocation, curCenter, z, tileSize, viewW, viewH)
+            drawCircle(color = Color(0x30007AFF), radius = 40f, center = pos)
+            drawCircle(color = Color.White, radius = 12f, center = pos)
+            drawCircle(color = Color(0xFF007AFF), radius = 9f, center = pos)
         }
 
         // Draw search pin
         if (searchPin != null) {
-            val pinPos = latLngToPixel(searchPin, center, z, tileSize, viewW, viewH)
-            // Pin shadow
-            drawCircle(
-                color = Color(0x40000000),
-                radius = 16f,
-                center = Offset(pinPos.x + 2f, pinPos.y + 2f),
-            )
-            // Red pin body (teardrop — just draw a large circle)
-            drawCircle(
-                color = Color(0xFFFF3B30),
-                radius = 14f,
-                center = Offset(pinPos.x, pinPos.y - 14f),
-            )
-            // White inner dot
-            drawCircle(
-                color = Color.White,
-                radius = 5f,
-                center = Offset(pinPos.x, pinPos.y - 14f),
-            )
-            // Pin point
-            drawCircle(
-                color = Color(0xFFFF3B30),
-                radius = 4f,
-                center = pinPos,
-            )
+            val pinPos = latLngToPixel(searchPin, curCenter, z, tileSize, viewW, viewH)
+            drawCircle(color = Color(0x40000000), radius = 16f, center = Offset(pinPos.x + 2f, pinPos.y + 2f))
+            drawCircle(color = Color(0xFFFF3B30), radius = 14f, center = Offset(pinPos.x, pinPos.y - 14f))
+            drawCircle(color = Color.White, radius = 5f, center = Offset(pinPos.x, pinPos.y - 14f))
+            drawCircle(color = Color(0xFFFF3B30), radius = 4f, center = pinPos)
         }
     }
 }
