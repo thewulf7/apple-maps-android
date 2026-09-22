@@ -93,15 +93,15 @@ class NativeMapView(private val context: Context) {
                 // ponytail: feature types uncracked, single style for all roads
                 // Casing (dark outline)
                 style.addLayer(LineLayer("l-road-case", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#C0C0C0"),
-                    PropertyFactory.lineWidth(2.5f),
+                    PropertyFactory.lineColor("#888888"),
+                    PropertyFactory.lineWidth(3.5f),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ))
-                // Fill (white)
+                // Fill (dark for visibility test)
                 style.addLayer(LineLayer("l-road-fill", SRC_LINE).withProperties(
                     PropertyFactory.lineColor("#FFFFFF"),
-                    PropertyFactory.lineWidth(1.8f),
+                    PropertyFactory.lineWidth(2.0f),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ))
@@ -114,7 +114,7 @@ class NativeMapView(private val context: Context) {
                 ))
 
                 mlMap.cameraPosition = CameraPosition.Builder()
-                    .target(LatLng(50.0853, 14.4031)).zoom(14.0).build()
+                    .target(LatLng(50.0853, 14.4031)).zoom(13.0).build()
 
                 mlMap.addOnCameraIdleListener { loadVisibleTiles() }
                 loadVisibleTiles()
@@ -141,20 +141,19 @@ class NativeMapView(private val context: Context) {
 
     // ── Tile loading ───────────────────────────────────────────────
 
+    private fun Double.round(decimals: Int) = String.format("%.${decimals}f", this)
+
     private fun loadVisibleTiles() {
         val m = map ?: return
         val bounds = m.projection.visibleRegion.latLngBounds
         val zoom = m.cameraPosition.zoom.toInt().coerceIn(1, 17)
         val n = 2.0.pow(zoom)
-        // size=2 tiles are 512px but MapLibre uses 256px grid, so viewport shows 2x fewer tiles.
-        // Pad by ±2 tiles to ensure coverage. ponytail: cheap fix beats proper tile-size config.
-        val pad = 2
-        val xMin = (((bounds.longitudeWest + 180) / 360 * n).toInt() - pad).coerceAtLeast(0)
-        val xMax = (((bounds.longitudeEast + 180) / 360 * n).toInt() + pad).coerceAtMost(n.toInt() - 1)
-        val yMin = (latToTileY(bounds.latitudeNorth, zoom) - pad).coerceAtLeast(0)
-        val yMax = (latToTileY(bounds.latitudeSouth, zoom) + pad).coerceAtMost(n.toInt() - 1)
+        val xMin = ((bounds.longitudeWest + 180) / 360 * n).toInt().coerceAtLeast(0)
+        val xMax = ((bounds.longitudeEast + 180) / 360 * n).toInt().coerceAtMost(n.toInt() - 1)
+        val yMin = latToTileY(bounds.latitudeNorth, zoom).coerceAtLeast(0)
+        val yMax = latToTileY(bounds.latitudeSouth, zoom).coerceAtMost(n.toInt() - 1)
         val tileCount = (xMax - xMin + 1) * (yMax - yMin + 1)
-        Log.d(TAG, "Loading $tileCount tiles z=$zoom x=$xMin..$xMax y=$yMin..$yMax")
+        Log.d(TAG, "Loading $tileCount tiles z=$zoom x=$xMin..$xMax y=$yMin..$yMax | bounds lon=[${bounds.longitudeWest.round(4)},${bounds.longitudeEast.round(4)}] lat=[${bounds.latitudeSouth.round(4)},${bounds.latitudeNorth.round(4)}]")
 
         scope.launch {
             // Fetch both style 1 (polygons/buildings) and style 20 (road network) per tile
