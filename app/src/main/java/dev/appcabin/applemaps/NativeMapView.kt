@@ -224,19 +224,41 @@ class NativeMapView(private val context: Context) {
                         polySb.append("""]]},"properties":{"ft":$ft}}""")
                     }
                 }
-                // Lines
+                // Lines — driven by LineFeature metadata (vs/vc = flat vertex indices)
+                // ponytail: MultiLineString when feature spans multiple shapes
                 parsed.lineVertices?.let { pool ->
-                    for (i in pool.shapeStarts.indices) {
-                        val start = pool.shapeStarts[i]
-                        val len = pool.shapeLengths[i]
-                        if (len < 2 || start + len > pool.vertices.size) continue
-                        if (!lf) lineSb.append(','); lf = false
-                        lineSb.append("""{"type":"Feature","geometry":{"type":"LineString","coordinates":[""")
-                        for (j in 0 until len) {
-                            if (j > 0) lineSb.append(',')
-                            appendCoord(lineSb, pool.vertices[start + j], tx, ty, zoom)
+                    val features = parsed.lines
+                    if (features.isEmpty()) {
+                        // fallback: raw shapes (no feature metadata)
+                        for (i in pool.shapeStarts.indices) {
+                            val start = pool.shapeStarts[i]; val len = pool.shapeLengths[i]
+                            if (len < 2 || start + len > pool.vertices.size) continue
+                            if (!lf) lineSb.append(','); lf = false
+                            lineSb.append("""{"type":"Feature","geometry":{"type":"LineString","coordinates":[""")
+                            for (j in 0 until len) { if (j > 0) lineSb.append(','); appendCoord(lineSb, pool.vertices[start + j], tx, ty, zoom) }
+                            lineSb.append("""]},"properties":{}}""")
                         }
-                        lineSb.append("""]},"properties":{}}""")
+                    } else {
+                        for (feat in features) {
+                            val shapeRange = pool.shapesForVertexRange(feat.vertexStart, feat.vertexCount)
+                            if (shapeRange.isEmpty()) continue
+                            val subLines = mutableListOf<String>()
+                            for (si in shapeRange) {
+                                val start = pool.shapeStarts[si]; val len = pool.shapeLengths[si]
+                                if (len < 2 || start + len > pool.vertices.size) continue
+                                val sb2 = StringBuilder("[")
+                                for (j in 0 until len) { if (j > 0) sb2.append(','); appendCoord(sb2, pool.vertices[start + j], tx, ty, zoom) }
+                                sb2.append(']')
+                                subLines.add(sb2.toString())
+                            }
+                            if (subLines.isEmpty()) continue
+                            if (!lf) lineSb.append(','); lf = false
+                            if (subLines.size == 1) {
+                                lineSb.append("""{"type":"Feature","geometry":{"type":"LineString","coordinates":${subLines[0]}},"properties":{}}""")
+                            } else {
+                                lineSb.append("""{"type":"Feature","geometry":{"type":"MultiLineString","coordinates":[${subLines.joinToString(",")}]},"properties":{}}""")
+                            }
+                        }
                     }
                 }
                 // Points

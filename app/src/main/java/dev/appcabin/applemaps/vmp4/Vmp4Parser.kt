@@ -189,46 +189,84 @@ data class VertexPool(
     val shapeStarts: List<Int>,
     /** Vertex count per shape */
     val shapeLengths: List<Int>,
-)
+) {
+    /**
+     * Build a prefix-sum of vertex counts so we can map flat-vertex ranges
+     * [vs, vs+vc) to shape indices efficiently.
+     * ponytail: O(shapeCount) precompute, no binary search needed since we
+     * scan features sequentially anyway.
+     */
+    val shapePrefixSums: IntArray by lazy {
+        IntArray(shapeLengths.size + 1).also { a ->
+            for (i in shapeLengths.indices) a[i + 1] = a[i] + shapeLengths[i]
+        }
+    }
+
+    /** Shape indices whose vertices fall within flat range [vsStart, vsStart+vsCount). */
+    fun shapesForVertexRange(vsStart: Int, vsCount: Int): IntRange {
+        if (vsCount <= 0 || shapePrefixSums.size < 2) return IntRange.EMPTY
+        val vsEnd = vsStart + vsCount
+        // First shape that starts at or after vsStart
+        val first = shapePrefixSums.indexOfFirst { it >= vsStart }.let {
+            if (it < 0) return IntRange.EMPTY
+            // step back if previous shape contains vsStart
+            if (it > 0 && shapePrefixSums[it - 1] < vsStart) it - 1 else it
+        }.coerceAtLeast(0)
+        // Last shape that ends before vsEnd
+        var last = first
+        while (last + 1 < shapeLengths.size && shapePrefixSums[last + 1] < vsEnd) last++
+        return if (first >= shapeLengths.size) IntRange.EMPTY else first..last.coerceAtMost(shapeLengths.size - 1)
+    }
+}
 
 fun decodeVertices(section: Vmp4Section): VertexPool? {
     val r = ChapterReader(section.data)
-    val shapeCount = try { r.readVarUint32() } catch (_: Exception) { return null }
-    val vertexCount = try { r.readVarUint32() } catch (_: Exception) { return null }
-    if (shapeCount == 0 || vertexCount == 0) return null
+    val shapeCapacity = try { r.readVarUint32() } catch (_: Exception) { return null }
+    val vertexCount   = try { r.readVarUint32() } catch (_: Exception) { return null }
+    if (shapeCapacity == 0 || vertexCount == 0) return null
 
     val bs = r.toBitStream()
-    val coordBits = bs.readBits(6)
-    val deltaBits = bs.readBits(6)
-    val runBits = bs.readBits(4)
+    // Header order confirmed via geo::codec::decodeSectionZEncoding decompile:
+    //   param_2[2] = coordBits  (first 6-bit read)
+    //   param_2[4] = runBits    (second 6-bit read) ← stored at index 4 in the struct
+    //   param_2[5] = deltaBits  (4-bit read)        ← stored at index 5
+    val coordBits = bs.readBits(6)  // param_2[2]
+    val runBits   = bs.readBits(6)  // param_2[4]  (was mistakenly called deltaBits)
+    val deltaBits = bs.readBits(4)  // param_2[5]  (was mistakenly called runBits)
     val hasCurves = bs.readBit()
 
     val scale = 1.0f / ((1 shl coordBits) - 1).toFloat()
-    val verts = mutableListOf<Vertex>()
-    val starts = mutableListOf<Int>()
+    val verts   = mutableListOf<Vertex>()
+    val starts  = mutableListOf<Int>()
     val lengths = mutableListOf<Int>()
-    var remaining = vertexCount
+
+    // Loop exactly vertexCount times (matches FUN_19aefb664: uVar22 = vertexCount, decremented per vertex)
+    // A new shape starts whenever remainingDeltas == 0
+    var remainingDeltas = 0
     var cx = 0; var cy = 0
 
-    for (s in 0 until shapeCount) {
-        val runLen = if (remaining > 0) {
-            if (runBits > 0) bs.readBits(runBits) else remaining
-        } else 0
-        starts.add(verts.size)
-        lengths.add(runLen)
-
-        for (v in 0 until runLen) {
-            if (v == 0) {
+    for (vi in 0 until vertexCount) {
+        try {
+            if (remainingDeltas == 0) {
+                // First vertex of new shape: read runLen, absolute x/y
+                val rawRl = if (runBits > 0) bs.readBits(runBits) else 0
+                remainingDeltas = rawRl  // uVar26 = rawRl; decremented per delta vertex
                 cx = bs.readBits(coordBits)
                 cy = bs.readBits(coordBits)
+                starts.add(verts.size)
+                // Shape length = rawRl + 1 (decompile: plVar19[1] = uVar26 + 1)
+                lengths.add(rawRl + 1)
             } else {
-                cx += bs.readBitsSigned(deltaBits)
-                cy += bs.readBitsSigned(deltaBits)
+                // Delta vertex
+                if (deltaBits > 0) {
+                    cx += bs.readBitsSigned(deltaBits)
+                    cy += bs.readBitsSigned(deltaBits)
+                }
+                remainingDeltas -= 1
             }
-            if (hasCurves) bs.readBit() // skip curve flag
+            if (hasCurves) bs.readBit()
             verts.add(Vertex(cx * scale, cy * scale))
-        }
-        remaining -= runLen
+        } catch (_: Exception) { break }
     }
 
     return VertexPool(coordBits, verts, starts, lengths)
