@@ -146,10 +146,13 @@ class NativeMapView(private val context: Context) {
         val bounds = m.projection.visibleRegion.latLngBounds
         val zoom = m.cameraPosition.zoom.toInt().coerceIn(1, 17)
         val n = 2.0.pow(zoom)
-        val xMin = ((bounds.longitudeWest + 180) / 360 * n).toInt().coerceAtLeast(0)
-        val xMax = ((bounds.longitudeEast + 180) / 360 * n).toInt().coerceAtMost(n.toInt() - 1)
-        val yMin = latToTileY(bounds.latitudeNorth, zoom).coerceAtLeast(0)
-        val yMax = latToTileY(bounds.latitudeSouth, zoom).coerceAtMost(n.toInt() - 1)
+        // size=2 tiles are 512px but MapLibre uses 256px grid, so viewport shows 2x fewer tiles.
+        // Pad by ±2 tiles to ensure coverage. ponytail: cheap fix beats proper tile-size config.
+        val pad = 2
+        val xMin = (((bounds.longitudeWest + 180) / 360 * n).toInt() - pad).coerceAtLeast(0)
+        val xMax = (((bounds.longitudeEast + 180) / 360 * n).toInt() + pad).coerceAtMost(n.toInt() - 1)
+        val yMin = (latToTileY(bounds.latitudeNorth, zoom) - pad).coerceAtLeast(0)
+        val yMax = (latToTileY(bounds.latitudeSouth, zoom) + pad).coerceAtMost(n.toInt() - 1)
         val tileCount = (xMax - xMin + 1) * (yMax - yMin + 1)
         Log.d(TAG, "Loading $tileCount tiles z=$zoom x=$xMin..$xMax y=$yMin..$yMax")
 
