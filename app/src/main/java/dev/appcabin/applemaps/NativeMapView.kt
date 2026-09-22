@@ -261,13 +261,6 @@ class NativeMapView(private val context: Context) {
                     (s.getSource(SRC_LINE) as? GeoJsonSource)?.setGeoJson(lineJson)
                     (s.getSource(SRC_POINT) as? GeoJsonSource)?.setGeoJson(pointJson)
                     Log.d(TAG, "Updated map: poly=${polySb.length}, line=${lineSb.length}, point=${pointSb.length} chars")
-                    // Log a sample of poly GeoJSON for debug
-                    val polyStr = polySb.toString()
-                    val ft64idx = polyStr.indexOf("\"ft\":64")
-                    val ft65idx = polyStr.indexOf("\"ft\":65")
-                    val ft94idx = polyStr.indexOf("\"ft\":94")
-                    Log.d(TAG, "ft64 first at char $ft64idx, ft65 at $ft65idx, ft94 at $ft94idx")
-                    if (ft64idx > 0) Log.d(TAG, "ft64 context: ...${polyStr.substring((ft64idx-20).coerceAtLeast(0), (ft64idx+50).coerceAtMost(polyStr.length))}")
                 }
             }
         }

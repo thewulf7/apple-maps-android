@@ -203,8 +203,6 @@ fun decodeVertices(section: Vmp4Section): VertexPool? {
     val runBits = bs.readBits(4)
     val hasCurves = bs.readBit()
 
-    android.util.Log.d("VMP4Verts", "decodeVertices: sc=$shapeCount vc=$vertexCount coordBits=$coordBits deltaBits=$deltaBits runBits=$runBits hasCurves=$hasCurves")
-
     val scale = 1.0f / ((1 shl coordBits) - 1).toFloat()
     val verts = mutableListOf<Vertex>()
     val starts = mutableListOf<Int>()
@@ -233,12 +231,7 @@ fun decodeVertices(section: Vmp4Section): VertexPool? {
         remaining -= runLen
     }
 
-    return VertexPool(coordBits, verts, starts, lengths).also {
-        if (verts.isNotEmpty()) {
-            val v0 = verts[0]
-            android.util.Log.d("VMP4Verts", "First vertex: raw=(${(v0.x / (1.0f/((1 shl coordBits)-1))).toInt()},${(v0.y / (1.0f/((1 shl coordBits)-1))).toInt()}) norm=(${v0.x},${v0.y})")
-        }
-    }
+    return VertexPool(coordBits, verts, starts, lengths)
 }
 
 // ── Feature decoding ───────────────────────────────────────────────────
