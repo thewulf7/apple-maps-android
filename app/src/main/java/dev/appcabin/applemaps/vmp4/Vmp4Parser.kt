@@ -240,22 +240,27 @@ fun decodeVertices(section: Vmp4Section): VertexPool? {
     val starts  = mutableListOf<Int>()
     val lengths = mutableListOf<Int>()
 
-    // Loop exactly vertexCount times (matches FUN_19aefb664: uVar22 = vertexCount, decremented per vertex)
-    // A new shape starts whenever remainingDeltas == 0
+    // Loop exactly shapeCapacity times — NOT vertexCount times.
+    // Confirmed by geometry analysis (Sep 24 2026): looping shapeCapacity gives all shapes
+    // including edge/boundary/coastline shapes. The first "vertexCount" field is actually
+    // the number of vertices in the first batch of regular polygon shapes, not the total.
+    // Looping vertexCount gives only ~20 shapes; looping shapeCapacity gives all 185+.
     var remainingDeltas = 0
     var cx = 0; var cy = 0
+    var shapesDecoded = 0
 
-    for (vi in 0 until vertexCount) {
+    while (shapesDecoded < shapeCapacity) {
         try {
             if (remainingDeltas == 0) {
                 // First vertex of new shape: read runLen, absolute x/y
                 val rawRl = if (runBits > 0) bs.readBits(runBits) else 0
-                remainingDeltas = rawRl  // uVar26 = rawRl; decremented per delta vertex
+                remainingDeltas = rawRl
                 cx = bs.readBits(coordBits)
                 cy = bs.readBits(coordBits)
                 starts.add(verts.size)
-                // Shape length = rawRl + 1 (decompile: plVar19[1] = uVar26 + 1)
                 lengths.add(rawRl + 1)
+                shapesDecoded++
+                if (rawRl == 0) remainingDeltas = 0  // single-vertex shape
             } else {
                 // Delta vertex
                 if (deltaBits > 0) {

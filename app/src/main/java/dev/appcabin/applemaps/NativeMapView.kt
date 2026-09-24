@@ -89,21 +89,18 @@ class NativeMapView(private val context: Context) {
                 ).withFilter(
                     Expression.raw("[\"all\",[\">\", [\"get\",\"ft\"], 99],[\"<\",[\"get\",\"ft\"],131]]")
                 ))
-                // Road network — Apple Maps style cased roads
-                // ponytail: feature types uncracked, single style for all roads
-                // Casing (dark outline)
-                style.addLayer(LineLayer("l-road-case", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#888888"),
-                    PropertyFactory.lineWidth(3.5f),
-                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                // Road network — line pool shapes are road AREA POLYGONS.
+                // Render as filled polygon (pavement area) with outline casing.
+                // Road casing (slightly darker than road fill for edge definition)
+                style.addLayer(FillLayer("l-road-case", SRC_LINE).withProperties(
+                    PropertyFactory.fillColor("#DDDBD6"),
+                    PropertyFactory.fillOutlineColor("#B8B4AE"),
+                    PropertyFactory.fillOpacity(1.0f),
                 ))
-                // Fill (dark for visibility test)
-                style.addLayer(LineLayer("l-road-fill", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#FFFFFF"),
-                    PropertyFactory.lineWidth(2.0f),
-                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                // Road fill (lighter pavement color on top)
+                style.addLayer(FillLayer("l-road-fill", SRC_LINE).withProperties(
+                    PropertyFactory.fillColor("#EDEAE4"),
+                    PropertyFactory.fillOpacity(1.0f),
                 ))
                 // POI points
                 style.addLayer(CircleLayer("l-point", SRC_POINT).withProperties(
@@ -200,41 +197,24 @@ class NativeMapView(private val context: Context) {
                         polySb.append(""""properties":{"ft":$ft}}""")
                     }
                 }
-                // Lines — driven by LineFeature metadata (vs/vc = flat vertex indices)
-                // ponytail: MultiLineString when feature spans multiple shapes
+                // Roads — line pool shapes are ROAD AREA POLYGONS (interleaved L/R edge vertices).
+                // Render as Polygon fills in the poly source (not LineStrings) for correct road area rendering.
+                // The road polygon outlines are added to lineSb for the casing/fill layer effect.
                 parsed.lineVertices?.let { pool ->
-                    val features = parsed.lines
-                    if (features.isEmpty()) {
-                        // fallback: raw shapes (no feature metadata)
-                        for (i in pool.shapeStarts.indices) {
-                            val start = pool.shapeStarts[i]; val len = pool.shapeLengths[i]
-                            if (len < 2 || start + len > pool.vertices.size) continue
-                            if (!lf) lineSb.append(','); lf = false
-                            lineSb.append("""{"type":"Feature","geometry":{"type":"LineString","coordinates":[""")
-                            for (j in 0 until len) { if (j > 0) lineSb.append(','); appendCoord(lineSb, pool.vertices[start + j], tx, ty, zoom) }
-                            lineSb.append("""]},"properties":{}}""")
+                    for (i in pool.shapeStarts.indices) {
+                        val start = pool.shapeStarts[i]
+                        val len = pool.shapeLengths[i]
+                        if (len < 3 || start + len > pool.vertices.size) continue
+                        // Add road polygons to lineSb — rendered as a FillLayer in road color
+                        if (!lf) lineSb.append(','); lf = false
+                        lineSb.append("""{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[""")
+                        for (j in 0 until len) {
+                            if (j > 0) lineSb.append(',')
+                            appendCoord(lineSb, pool.vertices[start + j], tx, ty, zoom)
                         }
-                    } else {
-                        for (feat in features) {
-                            val shapeRange = pool.shapesForVertexRange(feat.vertexStart, feat.vertexCount)
-                            if (shapeRange.isEmpty()) continue
-                            val subLines = mutableListOf<String>()
-                            for (si in shapeRange) {
-                                val start = pool.shapeStarts[si]; val len = pool.shapeLengths[si]
-                                if (len < 2 || start + len > pool.vertices.size) continue
-                                val sb2 = StringBuilder("[")
-                                for (j in 0 until len) { if (j > 0) sb2.append(','); appendCoord(sb2, pool.vertices[start + j], tx, ty, zoom) }
-                                sb2.append(']')
-                                subLines.add(sb2.toString())
-                            }
-                            if (subLines.isEmpty()) continue
-                            if (!lf) lineSb.append(','); lf = false
-                            if (subLines.size == 1) {
-                                lineSb.append("""{"type":"Feature","geometry":{"type":"LineString","coordinates":${subLines[0]}},"properties":{}}""")
-                            } else {
-                                lineSb.append("""{"type":"Feature","geometry":{"type":"MultiLineString","coordinates":[${subLines.joinToString(",")}]},"properties":{}}""")
-                            }
-                        }
+                        // Close the ring
+                        lineSb.append(','); appendCoord(lineSb, pool.vertices[start], tx, ty, zoom)
+                        lineSb.append("""]]},"properties":{}}""")
                     }
                 }
                 // Points
