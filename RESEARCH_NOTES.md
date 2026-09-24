@@ -178,10 +178,46 @@ Tiles cover:
 
 ---
 
+## Session Sep 24 2026 — Polygon 0x20 Fully Traced
+
+### Section 0x20 Structure (from full disasm of `_readPolygonsofType`)
+```
+varint  labelCount   ← 9 in all z=14 Prague tiles
+varint  featureCount ← 0 IN ALL 49 CORPUS TILES (feature loop never runs)
+remaining = label-association records (hp_readLabel format per feature)
+```
+- `featureCount=0` for every tile in corpus → the ft-classification loop is dead code.
+- Removed `decodePolygonFeatures` call from NativeMapView.kt.
+
+### Polygon Geometry Facts
+- Actual shape count = `len(starts)` after decoding, NOT the first varint (= labelCount)
+- z=14 Prague tiles: 20 polygon shapes per tile (large cross-tile boundary polygons)
+- z=8 tiles: 55–130 shapes per tile
+- Shapes are correct geographic slivers — land/water/park polygons span tile boundaries
+- Vertex coords confirmed in [−0.01, 1.01] range → correct scaled Web Mercator
+
+### Section 0x34 — Feature Type Classification (NOT YET DECODED)
+- Present alongside every 0x20 section in style-1 tiles
+- Header: `varint(0xFFFF)` + `varint N` + N entries
+- Holds per-shape feature type (water/park/building) — needed for color classification
+- Next priority: find the 0x34 decoder function in GeoServices disasm and trace it
+
+### Local Python Renderer
+- `render_local.py` — renders VMP4 tiles to PNG, validates geometry visually
+- Usage: `python3 render_local.py [path_to_tile.bin]`
+- Output: `/tmp/vmp4_renders/`
+- **Important:** `draw.polygon` in Pillow requires integer pixel coords (floats silently fail)
+
+### Java Version Note
+- Java 26 breaks Kotlin Gradle plugin (JavaVersion.parse throws on "26.0.2.1")
+- Build with: `JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew ...`
+
+---
+
 ## Next Steps (Priority Order)
 
-1. **Fix line rendering** — implement `vertex_start/vertex_count → shape range` mapping, emit per-feature polylines not per-shape fragments
-2. **Decode `0x33` section** — likely road name/label associations or road graph connectivity
-3. **Fix polygon class hash skip** — detect and skip the embedded hash bytes in `0x20` section class entries
-4. **Decode section `0x1F` sub-list** — understand what follows the initial feature array
-5. **Ghidra decompile** — extract VectorKit binary cleanly and decompile `readUIntBits`, `vertexPoolForFeature`, and the main tile-parse entry point to get ground truth on all above
+1. **Decode section 0x34** — find the decoder function for type 0x34 in GeoServices disasm (search for `chapterAt` calls with `w1 = #0x34` or similar). Port to Python, validate per-shape ft assignment, then update NativeMapView.kt color layers.
+2. **Line rendering validation** — `shapesForVertexRange` is implemented; verify it's producing correct polylines (not scribble) by running `render_local.py` on s20 tiles.
+3. **Decode `0x33` section** — present in style-20 tiles, unknown purpose (road graph or style?)
+4. **Section `0x8D` / `0x98`** — present in style-20, unknown
+5. **Viewport bug** — `size=2` tiles render one zoom level higher; real fix = `tileSize=512` in MapLibre config
