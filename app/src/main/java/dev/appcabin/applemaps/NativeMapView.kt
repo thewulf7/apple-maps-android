@@ -42,6 +42,10 @@ class NativeMapView(private val context: Context) {
     private val tileCache = object : LinkedHashMap<String, ParsedTile>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ParsedTile>?) = size > 256
     }
+    /** Per-tile style 99 ft maps: key="z/x/y", value=IntArray[512*512] of ft values */
+    private val style99Cache = object : LinkedHashMap<String, IntArray>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, IntArray>?) = size > 256
+    }
     val mapView: MapView
 
     init {
@@ -153,14 +157,13 @@ class NativeMapView(private val context: Context) {
         Log.d(TAG, "Loading $tileCount tiles z=$zoom x=$xMin..$xMax y=$yMin..$yMax | bounds lon=[${bounds.longitudeWest.round(4)},${bounds.longitudeEast.round(4)}] lat=[${bounds.latitudeSouth.round(4)},${bounds.latitudeNorth.round(4)}]")
 
         scope.launch {
-            // Fetch both style 1 (polygons/buildings) and style 20 (road network) per tile
+            // Fetch style 1 (polygons), style 20 (roads), and style 99 (classification raster)
             data class TileResult(val x: Int, val y: Int, val parsed: ParsedTile)
             val results = mutableListOf<TileResult>()
             val jobs = mutableListOf<Deferred<TileResult?>>()
+            val style99Jobs = mutableListOf<Deferred<Pair<String, IntArray?>>>()
 
-            // Style 1 = base polygons (land use, buildings) + sparse roads  
-            // Style 20 = dense road network overlay
-            // ponytail: only these two are confirmed working on gspe19-ssl
+            // Style 1 = base polygons, style 20 = roads
             val styles = listOf(1, 20)
 
             for (x in xMin..xMax) for (y in yMin..yMax) {
@@ -168,8 +171,20 @@ class NativeMapView(private val context: Context) {
                 for (style in styles) {
                     jobs.add(async { fetchAndParse(zoom, tx, ty, style = style)?.let { TileResult(tx, ty, it) } })
                 }
+                // Style 99 = per-pixel style class raster (water=1, park=2, land=0)
+                val key99 = "$zoom/$tx/$ty"
+                if (!synchronized(style99Cache) { style99Cache.containsKey(key99) }) {
+                    style99Jobs.add(async {
+                        key99 to fetchStyle99(zoom, tx, ty)
+                    })
+                }
             }
             jobs.mapNotNull { it.await() }.let { results.addAll(it) }
+            // Store style 99 results
+            style99Jobs.forEach { job ->
+                val (k, ftMap) = job.await()
+                if (ftMap != null) synchronized(style99Cache) { style99Cache[k] = ftMap }
+            }
 
             val polySb = StringBuilder("""{"type":"FeatureCollection","features":[""")
             val lineSb = StringBuilder("""{"type":"FeatureCollection","features":[""")
@@ -178,14 +193,20 @@ class NativeMapView(private val context: Context) {
 
             for (tile in results) {
                 val (tx, ty, parsed) = tile
-                // Polygons — featureCount=0 in all corpus tiles, 0x34 section has ft map (not yet decoded).
-                // Render all polygon shapes as land color (ft=0) until 0x34 is decoded.
+                // Polygons — sample style 99 raster at centroid for ft classification.
+                // Style 99: value 0=land, 1=water, 2=park → mapped to ft 0/94/64.
                 parsed.polygonVertices?.let { pool ->
+                    val ftMap = synchronized(style99Cache) { style99Cache["$zoom/$tx/$ty"] }
                     for (i in pool.shapeStarts.indices) {
                         val start = pool.shapeStarts[i]
                         val len = pool.shapeLengths[i]
                         if (len < 3 || start + len > pool.vertices.size) continue
-                        val ft = 0 // land default until 0x34 ft classification is decoded
+                        // Sample style 99 at shape centroid for feature type classification
+                        val ft = if (ftMap != null) {
+                            val cx = pool.vertices.subList(start, start + len).sumOf { it.x.toDouble() }.toFloat() / len
+                            val cy = pool.vertices.subList(start, start + len).sumOf { it.y.toDouble() }.toFloat() / len
+                            Style99Decoder.sampleFt(ftMap, cx, cy)
+                        } else 0
                         if (!pf) polySb.append(','); pf = false
                         polySb.append("""{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[""")
                         for (j in 0 until len) {
@@ -276,6 +297,28 @@ class NativeMapView(private val context: Context) {
     }
 
     // ── GeoJSON helpers ────────────────────────────────────────────
+
+    /** Fetch and decode style 99 tile (per-pixel style class raster). */
+    private suspend fun fetchStyle99(z: Int, x: Int, y: Int): IntArray? {
+        return try {
+            val url = NativeAuth.style99TileUrl(z, x, y)
+            val bytes = client.get(url).bodyAsBytes()
+            if (bytes.size < 8) {
+                Log.w(TAG, "Style99 $z/$x/$y: too small ${bytes.size}b")
+                null
+            } else {
+                Style99Decoder.decode(bytes).also { result ->
+                    if (result != null)
+                        Log.d(TAG, "Style99 $z/$x/$y: decoded ${result.size} pixels")
+                    else
+                        Log.w(TAG, "Style99 $z/$x/$y: decode failed")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Style99 $z/$x/$y fetch failed: ${e.message}")
+            null
+        }
+    }
 
     private fun appendCoord(sb: StringBuilder, v: Vertex, tx: Int, ty: Int, z: Int) {
         val (lon, lat) = tileToWgs84(tx, ty, z, v.x, v.y)

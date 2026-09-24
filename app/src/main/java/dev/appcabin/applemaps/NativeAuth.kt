@@ -69,4 +69,16 @@ object NativeAuth {
         val base = "https://gspe19-ssl.ls.apple.com/tile.vf?flags=8&style=1&size=2&scale=0&v=$version&z=$z&x=$x&y=$y"
         return signUrl(base)
     }
+
+    /**
+     * Style 99 tile URL — per-pixel style class raster (16-bit PNG).
+     * Values: 0=land, 1=water, 2=park, 3-4=water variants.
+     * Version 654 confirmed from macOS ActiveTileGroup.pbd (Sep 2026).
+     *
+     * Endpoint: gspe11-ssl.ls.apple.com (raster tile CDN, different from VMP4 gspe19)
+     */
+    fun style99TileUrl(z: Int, x: Int, y: Int): String {
+        val base = "https://gspe11-ssl.ls.apple.com/tile?style=99&size=2&scale=0&v=654&z=$z&x=$x&y=$y"
+        return signUrl(base)
+    }
 }
