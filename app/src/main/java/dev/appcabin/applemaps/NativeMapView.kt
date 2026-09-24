@@ -181,41 +181,14 @@ class NativeMapView(private val context: Context) {
 
             for (tile in results) {
                 val (tx, ty, parsed) = tile
-                // Polygons — emit feature type as "ft" for color filtering
-                // ponytail: build shape→ft map from class ranges once, reuse per shape
+                // Polygons — featureCount=0 in all corpus tiles, 0x34 section has ft map (not yet decoded).
+                // Render all polygon shapes as land color (ft=0) until 0x34 is decoded.
                 parsed.polygonVertices?.let { pool ->
-                    val shapeCount = pool.shapeStarts.size
-                    val shapeFt = IntArray(shapeCount)
-                    // Classes assign ft to shape ranges via vertexStart..vertexStart+outerCount
-                    // Some class fields are corrupt (hash bytes read as varints) — clamp defensively
-                    for (cls in parsed.polygons) {
-                        val ft = cls.featureType
-                        Log.d(TAG, "rawcls: vs=${cls.vertexStart} oc=${cls.outerCount} hc=${cls.holeCount} ft=$ft si=${cls.styleIndex}")
-                        // Skip garbage (hash bytes misread as varint → huge) and land default (0)
-                        if (ft <= 0 || ft > 127) continue
-                        val s = cls.vertexStart.coerceIn(0, shapeCount - 1)
-                        val n = cls.outerCount.coerceIn(0, shapeCount)
-                        val e = (s + n).coerceAtMost(shapeCount)
-                        if (e > s) for (k in s until e) shapeFt[k] = ft
-                    }
-                    Log.d(TAG, "shapeFt sample: ${shapeFt.take(20).toList()} nonzero=${shapeFt.count { it != 0 }}")
-                    // Count ft distribution
-                    val ftDist = shapeFt.groupBy { it }.mapValues { it.value.size }
-                    Log.d(TAG, "shapeFt distribution: $ftDist")
-                    // Log first polygon coords for debugging
-                    if (pool.shapeStarts.isNotEmpty()) {
-                        val s0 = pool.shapeStarts[0]; val l0 = pool.shapeLengths[0]
-                        if (l0 > 0) {
-                            val v0 = pool.vertices[s0]
-                            val (lon0, lat0) = tileToWgs84(tx, ty, zoom, v0.x, v0.y)
-                            Log.d(TAG, "Tile $tx/$ty/$zoom poly[0] v0: raw=(${v0.x},${v0.y}) wgs84=($lat0,$lon0)")
-                        }
-                    }
                     for (i in pool.shapeStarts.indices) {
                         val start = pool.shapeStarts[i]
                         val len = pool.shapeLengths[i]
                         if (len < 3 || start + len > pool.vertices.size) continue
-                        val ft = shapeFt[i]
+                        val ft = 0 // land default until 0x34 ft classification is decoded
                         if (!pf) polySb.append(','); pf = false
                         polySb.append("""{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[""")
                         for (j in 0 until len) {
@@ -223,7 +196,8 @@ class NativeMapView(private val context: Context) {
                             appendCoord(polySb, pool.vertices[start + j], tx, ty, zoom)
                         }
                         polySb.append(','); appendCoord(polySb, pool.vertices[start], tx, ty, zoom)
-                        polySb.append("""]]},"properties":{"ft":$ft}}""")
+                        polySb.append("""]]},""")
+                        polySb.append(""""properties":{"ft":$ft}}""")
                     }
                 }
                 // Lines — driven by LineFeature metadata (vs/vc = flat vertex indices)
