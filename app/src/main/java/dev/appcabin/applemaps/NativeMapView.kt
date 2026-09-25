@@ -655,5 +655,5 @@ class NativeMapView(private val context: Context) {
 }
 
 private val BLANK_STYLE = """
-{"version":8,"name":"Apple Maps","glyphs":"https://fonts.openmaptiles.org/{fontstack}/{range}.pbf","sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#F2EFE9"}}]}
+{"version":8,"name":"Apple Maps","glyphs":"https://tiles.stadiamaps.com/fonts/{fontstack}/{range}.pbf","sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#F2EFE9"}}]}
 """.trim()
