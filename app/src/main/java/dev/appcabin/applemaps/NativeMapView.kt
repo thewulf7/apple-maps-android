@@ -1,6 +1,7 @@
 package dev.appcabin.applemaps
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.util.Log
 import io.ktor.client.*
 import io.ktor.client.request.*
@@ -16,7 +17,9 @@ import org.maplibre.android.maps.MapLibreMapOptions
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.*
+import org.maplibre.android.geometry.LatLngQuad
 import org.maplibre.android.style.sources.GeoJsonSource
+import org.maplibre.android.style.sources.ImageSource
 import dev.appcabin.applemaps.vmp4.*
 import kotlin.math.floor
 import kotlin.math.ln
@@ -46,6 +49,8 @@ class NativeMapView(private val context: Context) {
     private val style99Cache = object : LinkedHashMap<String, IntArray>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, IntArray>?) = size > 256
     }
+    /** Track which style99 image sources have been added to the MapLibre style (avoid duplicates). */
+    private val style99Added = mutableSetOf<String>()
     val mapView: MapView
 
     init {
@@ -115,7 +120,7 @@ class NativeMapView(private val context: Context) {
                 ))
 
                 mlMap.cameraPosition = CameraPosition.Builder()
-                    .target(LatLng(50.0853, 14.4031)).zoom(13.0).build()
+                    .target(LatLng(50.0868, 14.4115)).zoom(14.0).build()
 
                 mlMap.addOnCameraIdleListener { loadVisibleTiles() }
                 loadVisibleTiles()
@@ -172,10 +177,16 @@ class NativeMapView(private val context: Context) {
                     jobs.add(async { fetchAndParse(zoom, tx, ty, style = style)?.let { TileResult(tx, ty, it) } })
                 }
                 // Style 99 = per-pixel style class raster (water=1, park=2, land=0)
-                val key99 = "$zoom/$tx/$ty"
-                if (!synchronized(style99Cache) { style99Cache.containsKey(key99) }) {
+                // Style 99 is ONLY available at z=14 (confirmed from ActiveTileGroup.pbd).
+                // For z>14: clamp to z=14 parent tile.
+                // For z<14: not available (no polygon data either at z<14).
+                val s99z = 14
+                val s99x = if (zoom <= 14) tx shr (14 - zoom) else tx shl (zoom - 14)
+                val s99y = if (zoom <= 14) ty shr (14 - zoom) else ty shl (zoom - 14)
+                val key99 = "$s99z/$s99x/$s99y"
+                if (zoom >= 13 && !synchronized(style99Cache) { style99Cache.containsKey(key99) }) {
                     style99Jobs.add(async {
-                        key99 to fetchStyle99(zoom, tx, ty)
+                        key99 to fetchStyle99(s99z, s99x, s99y)
                     })
                 }
             }
@@ -196,7 +207,10 @@ class NativeMapView(private val context: Context) {
                 // Polygons — sample style 99 raster at centroid for ft classification.
                 // Style 99: value 0=land, 1=water, 2=park → mapped to ft 0/94/64.
                 parsed.polygonVertices?.let { pool ->
-                    val ftMap = synchronized(style99Cache) { style99Cache["$zoom/$tx/$ty"] }
+                    val s99z14 = 14
+                    val s99x14 = if (zoom <= 14) tx shr (14 - zoom) else tx shl (zoom - 14)
+                    val s99y14 = if (zoom <= 14) ty shr (14 - zoom) else ty shl (zoom - 14)
+                    val ftMap = synchronized(style99Cache) { style99Cache["$s99z14/$s99x14/$s99y14"] }
                     for (i in pool.shapeStarts.indices) {
                         val start = pool.shapeStarts[i]
                         val len = pool.shapeLengths[i]
@@ -260,6 +274,51 @@ class NativeMapView(private val context: Context) {
                     (s.getSource(SRC_LINE) as? GeoJsonSource)?.setGeoJson(lineJson)
                     (s.getSource(SRC_POINT) as? GeoJsonSource)?.setGeoJson(pointJson)
                     Log.d(TAG, "Updated map: poly=${polySb.length}, line=${lineSb.length}, point=${pointSb.length} chars")
+
+                    // Add style99 raster layers for tiles that haven't been added yet
+                    val n14 = 1 shl 14
+                    for (x in xMin..xMax) for (y in yMin..yMax) {
+                        val s99x = x shr (zoom - 14).coerceAtLeast(0)
+                        val s99y = y shr (zoom - 14).coerceAtLeast(0)
+                        val key = "14/$s99x/$s99y"
+                        val ftMap = synchronized(style99Cache) { style99Cache[key] } ?: continue
+                        if (key in style99Added) continue
+
+                        // Build ARGB bitmap from ft values
+                        val colors = IntArray(512 * 512) { i ->
+                            when (ftMap[i]) {
+                                94 -> 0xFFA8D4F0.toInt()  // water #A8D4F0
+                                64 -> 0xFFD4E8C2.toInt()  // park  #D4E8C2
+                                else -> 0x00000000         // transparent (land drawn by bg)
+                            }
+                        }
+                        val bitmap = Bitmap.createBitmap(colors, 512, 512,
+                            Bitmap.Config.ARGB_8888)
+
+                        // Geographic bounds of the z=14 tile
+                        val lonMin = s99x.toDouble() / n14 * 360.0 - 180.0
+                        val lonMax = (s99x + 1).toDouble() / n14 * 360.0 - 180.0
+                        val latMax = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * s99y / n14))))
+                        val latMin = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * (s99y + 1).toDouble() / n14))))
+
+                        val srcId = "s99-$key"
+                        val lyrId = "l-s99-$key"
+                        try {
+                            s.addSource(ImageSource(srcId, LatLngQuad(
+                                LatLng(latMax, lonMin), LatLng(latMax, lonMax),
+                                LatLng(latMin, lonMax), LatLng(latMin, lonMin)
+                            ), bitmap))
+                            // Add BELOW the land layer so polygons render on top
+                            s.addLayerBelow(RasterLayer(lyrId, srcId).withProperties(
+                                PropertyFactory.rasterOpacity(1.0f)
+                            ), "l-land")
+                            style99Added.add(key)
+                            Log.d(TAG, "Added style99 raster $key")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to add style99 raster $key: ${e.message}")
+                        }
+                        bitmap.recycle()
+                    }
                 }
             }
         }
