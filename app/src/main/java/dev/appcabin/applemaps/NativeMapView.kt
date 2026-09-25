@@ -68,6 +68,23 @@ class NativeMapView(private val context: Context) {
                 style.addSource(GeoJsonSource(SRC_POLY))
                 style.addSource(GeoJsonSource(SRC_LINE))
                 style.addSource(GeoJsonSource(SRC_POINT))
+                // Load bundled place/neighborhood names
+                val placesGeoJson = try {
+                    context.assets.open("prague_places.geojson").bufferedReader().use { it.readText() }
+                } catch (_: Exception) { null }
+                val SRC_PLACES = "places"
+                if (placesGeoJson != null) style.addSource(GeoJsonSource(SRC_PLACES, placesGeoJson))
+                // OSM vector water polygons (Vltava + ponds/canals)
+                val waterGeoJson = try {
+                    val wgj = context.assets.open("prague_water.geojson").bufferedReader().use { it.readText() }
+                    Log.d(TAG, "Water GeoJSON loaded: ${wgj.length} chars")
+                    wgj
+                } catch (e: Exception) { Log.w(TAG, "Water load failed: ${e.message}"); null }
+                val SRC_WATER = "osm-water"
+                if (waterGeoJson != null) {
+                    style.addSource(GeoJsonSource(SRC_WATER, waterGeoJson))
+                    Log.d(TAG, "Water source added with ${waterGeoJson.length} chars")
+                }
 
                 // Polygon fills — Apple Maps color palette by feature type
                 // ponytail: separate sources per feature class beats data-driven for clarity
@@ -77,6 +94,9 @@ class NativeMapView(private val context: Context) {
                     PropertyFactory.fillColor("#F2EFE9"),
                     PropertyFactory.fillOpacity(1.0f),
                 ))
+                // OSM vector water — disabled (geom issues with large river polygons)
+                // style.addLayer(FillLayer("l-water-osm", SRC_WATER)...)
+
                 // Parks — green
                 // Use Expression.raw() — Expression.literal(int) type-mismatches JSON double ft values
                 style.addLayer(FillLayer("l-park", SRC_POLY).withProperties(
@@ -127,19 +147,32 @@ class NativeMapView(private val context: Context) {
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["primary","secondary"]]]""")))
-                // Layer 3: Tertiary/residential (thin white) - renamed from old l-road-case/fill
-                style.addLayer(LineLayer("l-road-case", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#D4D1C8"),
-                    PropertyFactory.lineWidth(4.5f),
+                // Layer 3: Tertiary (medium) and Residential (thin) — clear hierarchy
+                style.addLayer(LineLayer("l-road-tertiary-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#D0CDBC"),
+                    PropertyFactory.lineWidth(3.5f),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["tertiary","residential","unclassified"]]]""")))
+                ).withFilter(Expression.raw("""["==",["get","highway"],"tertiary"]""")))
+                style.addLayer(LineLayer("l-road-tertiary", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#FFFFFF"),
+                    PropertyFactory.lineWidth(2.5f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["==",["get","highway"],"tertiary"]""")))
+                // Residential: very thin, just barely visible
+                style.addLayer(LineLayer("l-road-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#D8D5CC"),
+                    PropertyFactory.lineWidth(2.5f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["residential","unclassified"]]]""")))
                 style.addLayer(LineLayer("l-road-fill", SRC_LINE).withProperties(
                     PropertyFactory.lineColor("#FFFFFF"),
-                    PropertyFactory.lineWidth(3.0f),
+                    PropertyFactory.lineWidth(1.5f),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["tertiary","residential","unclassified"]]]""")))
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["residential","unclassified"]]]""")))
                 // ── Labels ───────────────────────────────────────────────
                 // Road name labels — only on features that have a name property
                 // Use "has" filter to avoid crash on unnamed roads
@@ -158,8 +191,8 @@ class NativeMapView(private val context: Context) {
                 ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["primary","secondary","trunk","motorway"]]]]""")))
                 style.addLayer(SymbolLayer("l-label-road-minor", SRC_LINE).withProperties(
                     PropertyFactory.textField(Expression.get("name")),
-                    PropertyFactory.textSize(10.0f),
-                    PropertyFactory.textColor("#605E58"),
+                    PropertyFactory.textSize(9.5f),
+                    PropertyFactory.textColor("#686460"),
                     PropertyFactory.textHaloColor("#FFFDF8"),
                     PropertyFactory.textHaloWidth(2.0f),
                     PropertyFactory.symbolPlacement("line"),
@@ -169,16 +202,37 @@ class NativeMapView(private val context: Context) {
                     PropertyFactory.textAllowOverlap(false),
                     PropertyFactory.textFont(arrayOf("Open Sans Regular", "Arial Unicode MS Regular")),
                 ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["tertiary","residential","unclassified"]]]]""")))
-                // POI points
-                style.addLayer(CircleLayer("l-point", SRC_POINT).withProperties(
-                    PropertyFactory.circleRadius(2.5f),
-                    PropertyFactory.circleColor("#FF5722"),
-                    PropertyFactory.circleStrokeWidth(0.5f),
-                    PropertyFactory.circleStrokeColor("#FFFFFF"),
+                // Neighborhood / district name labels
+                style.addLayer(SymbolLayer("l-label-places", SRC_PLACES).withProperties(
+                    PropertyFactory.textField(Expression.get("name")),
+                    PropertyFactory.textSize(Expression.match(
+                        Expression.get("type"),
+                        Expression.literal(12.0f),
+                        Expression.stop("suburb", 13.5f),
+                        Expression.stop("neighbourhood", 11.0f),
+                        Expression.stop("water", 13.0f)
+                    )),
+                    PropertyFactory.textColor(Expression.match(
+                        Expression.get("type"),
+                        Expression.literal("#666660"),
+                        Expression.stop("water", "#3B7EA6"),
+                        Expression.stop("suburb", "#333330")
+                    )),
+                    PropertyFactory.textHaloColor("#FFFEFB"),
+                    PropertyFactory.textHaloWidth(2.0f),
+                    PropertyFactory.textLetterSpacing(0.08f),
+                    PropertyFactory.textTransform(Property.TEXT_TRANSFORM_UPPERCASE),
+                    PropertyFactory.textFont(arrayOf("Open Sans Regular", "Arial Unicode MS Regular")),
+                    PropertyFactory.textAllowOverlap(false),
+                    PropertyFactory.textOptional(true),
+                    PropertyFactory.iconAllowOverlap(false),
                 ))
 
+                // POI points — disabled until proper icon/label data is available
+                // style.addLayer(CircleLayer("l-point", SRC_POINT)...)
+
                 mlMap.cameraPosition = CameraPosition.Builder()
-                    .target(LatLng(50.0850, 14.4100)).zoom(14.0).build()
+                    .target(LatLng(50.0868, 14.4115)).zoom(14.0).build()
 
                 mlMap.addOnCameraIdleListener { loadVisibleTiles() }
                 loadVisibleTiles()
@@ -321,52 +375,74 @@ class NativeMapView(private val context: Context) {
                     (s.getSource(SRC_POINT) as? GeoJsonSource)?.setGeoJson(pointJson)
                     Log.d(TAG, "Updated map: poly=${polySb.length}, line=${lineJson.length}, point=${pointSb.length} chars")
 
-                    // Add style99 raster layers for tiles that haven't been added yet
+                    // Composite ALL loaded style99 tiles into ONE seamless bitmap
+                    // This eliminates seam lines between individual tile images
                     val n14 = 1 shl 14
-                    for (x in xMin..xMax) for (y in yMin..yMax) {
-                        val s99x = x shr (zoom - 14).coerceAtLeast(0)
-                        val s99y = y shr (zoom - 14).coerceAtLeast(0)
-                        val key = "14/$s99x/$s99y"
-                        val ftMap = synchronized(style99Cache) { style99Cache[key] } ?: continue
-                        if (key in style99Added) continue
+                    val tileSize = 512
+                    val cols = xMax - xMin + 1
+                    val rows = yMax - yMin + 1
 
-                        // Build ARGB bitmap from ft values, upscaled for smooth edges
-                        val srcSize = 512; val dstSize = 1024  // 2x upscale for smooth rendering
-                        val colors = IntArray(srcSize * srcSize) { i ->
-                            when (ftMap[i]) {
-                                94 -> 0xFFA8D4F0.toInt()  // water #A8D4F0
-                                64 -> 0xFFD4E8C2.toInt()  // park  #D4E8C2
-                                else -> 0x00000000         // transparent (land drawn by bg)
-                            }
+                    // Collect tiles (map to z=14 coords)
+                    val tileGrid = Array(rows) { row -> Array(cols) { col ->
+                        val s99x = (xMin + col) shr (zoom - 14).coerceAtLeast(0)
+                        val s99y = (yMin + row) shr (zoom - 14).coerceAtLeast(0)
+                        synchronized(style99Cache) { style99Cache["14/$s99x/$s99y"] }
+                    }}
+
+                    // Check if all tiles loaded and composite changed
+                    val allLoaded = tileGrid.all { row -> row.all { it != null } }
+                    val compositeKey = "composite-$zoom-$xMin-$xMax-$yMin-$yMax"
+                    if (allLoaded && compositeKey !in style99Added) {
+                        val totalW = cols * tileSize
+                        val totalH = rows * tileSize
+                        val composite = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
+                        val canvas = android.graphics.Canvas(composite)
+                        val paint = android.graphics.Paint().apply {
+                            isFilterBitmap = true; isAntiAlias = true
                         }
-                        val srcBitmap = Bitmap.createBitmap(colors, srcSize, srcSize, Bitmap.Config.ARGB_8888)
-                        val bitmap = android.graphics.Bitmap.createScaledBitmap(srcBitmap, dstSize, dstSize, true)
-                        srcBitmap.recycle()
 
-                        // Geographic bounds of the z=14 tile
-                        val lonMin = s99x.toDouble() / n14 * 360.0 - 180.0
-                        val lonMax = (s99x + 1).toDouble() / n14 * 360.0 - 180.0
-                        val latMax = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * s99y / n14))))
-                        val latMin = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * (s99y + 1).toDouble() / n14))))
+                        for (row in 0 until rows) for (col in 0 until cols) {
+                            val ftMap = tileGrid[row][col] ?: continue
+                            val colors = IntArray(tileSize * tileSize) { i ->
+                                when (ftMap[i]) {
+                                    94 -> 0xFF8EC8E8.toInt()   // water blue
+                                    64 -> 0xFFD4E8C2.toInt()   // park green
+                                    else -> 0x00000000          // transparent
+                                }
+                            }
+                            val tileBmp = Bitmap.createBitmap(colors, tileSize, tileSize, Bitmap.Config.ARGB_8888)
+                            canvas.drawBitmap(tileBmp, (col * tileSize).toFloat(), (row * tileSize).toFloat(), paint)
+                            tileBmp.recycle()
+                        }
 
-                        val srcId = "s99-$key"
-                        val lyrId = "l-s99-$key"
+                        // Remove any old composite source/layer
+                        style99Added.filter { it.startsWith("composite-") }.forEach { old ->
+                            try { s.removeLayer("l-s99-$old"); s.removeSource("s99-$old") } catch (_: Exception) {}
+                        }
+                        style99Added.removeAll { it.startsWith("composite-") }
+
+                        // Geographic bounds of the entire composite
+                        val lonMin = xMin.toDouble() / n14 * 360.0 - 180.0
+                        val lonMax = (xMax + 1).toDouble() / n14 * 360.0 - 180.0
+                        val latMax = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * yMin / n14))))
+                        val latMin = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * (yMax + 1).toDouble() / n14))))
+
                         try {
-                            s.addSource(ImageSource(srcId, LatLngQuad(
+                            s.addSource(ImageSource("s99-$compositeKey", LatLngQuad(
                                 LatLng(latMax, lonMin), LatLng(latMax, lonMax),
                                 LatLng(latMin, lonMax), LatLng(latMin, lonMin)
-                            ), bitmap))
-                            // Add BELOW the land layer so polygons render on top
-                            s.addLayerBelow(RasterLayer(lyrId, srcId).withProperties(
+                            ), composite))
+                            s.addLayerBelow(RasterLayer("l-s99-$compositeKey", "s99-$compositeKey").withProperties(
                                 PropertyFactory.rasterOpacity(1.0f),
                                 PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_LINEAR)
                             ), "l-land")
-                            style99Added.add(key)
-                            Log.d(TAG, "Added style99 raster $key")
+                            style99Added.add(compositeKey)
+                            composite.recycle()
+                            Log.d(TAG, "Added composite style99 raster ${cols}x${rows} tiles")
                         } catch (e: Exception) {
-                            Log.w(TAG, "Failed to add style99 raster $key: ${e.message}")
+                            Log.w(TAG, "Failed to add composite raster: ${e.message}")
+                            composite.recycle()
                         }
-                        bitmap.recycle()
                     }
                 }
             }
