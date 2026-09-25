@@ -6,6 +6,8 @@ import android.util.Log
 import io.ktor.client.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
+import io.ktor.http.*
+import io.ktor.client.request.forms.*
 import kotlinx.coroutines.*
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraPosition
@@ -98,15 +100,46 @@ class NativeMapView(private val context: Context) {
                 ).withFilter(
                     Expression.raw("[\"all\",[\">\", [\"get\",\"ft\"], 99],[\"<\",[\"get\",\"ft\"],131]]")
                 ))
-                // Road layers hidden (road data causes visual artifacts at z=14).
-                style.addLayer(FillLayer("l-road-case", SRC_LINE).withProperties(
-                    PropertyFactory.fillColor("#F2EFE9"),  // same as land - invisible
-                    PropertyFactory.fillOpacity(0.0f),
-                ))
-                style.addLayer(FillLayer("l-road-fill", SRC_LINE).withProperties(
-                    PropertyFactory.fillColor("#F2EFE9"),
-                    PropertyFactory.fillOpacity(0.0f),
-                ))
+                // Road network from OSM — Apple Maps style hierarchy
+                // Layer 1: Motorways/trunk (yellow, thick)
+                style.addLayer(LineLayer("l-road-hw-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#E6AD30"),
+                    PropertyFactory.lineWidth(10.0f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["motorway","trunk"]]]""")))
+                style.addLayer(LineLayer("l-road-hw", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#F5C850"),
+                    PropertyFactory.lineWidth(7.0f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["motorway","trunk"]]]""")))
+                // Layer 2: Primary roads (thick white)
+                style.addLayer(LineLayer("l-road-primary-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#D0CDBF"),
+                    PropertyFactory.lineWidth(8.0f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["primary","secondary"]]]""")))
+                style.addLayer(LineLayer("l-road-primary", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#FFFFFF"),
+                    PropertyFactory.lineWidth(5.5f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["primary","secondary"]]]""")))
+                // Layer 3: Tertiary/residential (thin white) - renamed from old l-road-case/fill
+                style.addLayer(LineLayer("l-road-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#D4D1C8"),
+                    PropertyFactory.lineWidth(4.5f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["tertiary","residential","unclassified"]]]""")))
+                style.addLayer(LineLayer("l-road-fill", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#FFFFFF"),
+                    PropertyFactory.lineWidth(3.0f),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["tertiary","residential","unclassified"]]]""")))
                 // POI points
                 style.addLayer(CircleLayer("l-point", SRC_POINT).withProperties(
                     PropertyFactory.circleRadius(2.5f),
@@ -116,7 +149,7 @@ class NativeMapView(private val context: Context) {
                 ))
 
                 mlMap.cameraPosition = CameraPosition.Builder()
-                    .target(LatLng(50.0868, 14.4115)).zoom(14.0).build()
+                    .target(LatLng(50.0850, 14.4100)).zoom(14.0).build()
 
                 mlMap.addOnCameraIdleListener { loadVisibleTiles() }
                 loadVisibleTiles()
@@ -165,8 +198,11 @@ class NativeMapView(private val context: Context) {
             val jobs = mutableListOf<Deferred<TileResult?>>()
             val style99Jobs = mutableListOf<Deferred<Pair<String, IntArray?>>>()
 
-            // Style 1 = base polygons, style 20 = roads
-            val styles = listOf(1, 20)
+            // Style 1 = base polygons (OSM roads fetched separately)
+            val styles = listOf(1)
+
+            // Kick off OSM road fetch for the entire visible area (one request covers all tiles)
+            val osmJob: Deferred<String?> = async { fetchOsmRoads(xMin, xMax, yMin, yMax, zoom) }
 
             for (x in xMin..xMax) for (y in yMin..yMax) {
                 val tx = x; val ty = y
@@ -229,8 +265,7 @@ class NativeMapView(private val context: Context) {
                         polySb.append(""""properties":{"ft":$ft}}""")
                     }
                 }
-                // Roads disabled — road area polygons cause visual artifacts at this zoom.
-                // TODO: implement proper road centerline rendering when data source is available.
+                // Roads are now from OSM — lineSb will be populated below after OSM fetch
                 // Points
                 parsed.pointVertices?.let { pool ->
                     for (v in pool.vertices) {
@@ -242,9 +277,12 @@ class NativeMapView(private val context: Context) {
                 }
             }
 
-            polySb.append("]}"); lineSb.append("]}"); pointSb.append("]}")
+            polySb.append("]}"); pointSb.append("]}")
+            // lineSb populated by OSM roads
+            val osmRoadsJson = osmJob.await()
             val polyJson = polySb.toString()
-            val lineJson = lineSb.toString()
+            val emptyGeoJson = """{"type":"FeatureCollection","features":[]}"""
+            val lineJson = osmRoadsJson ?: emptyGeoJson
             val pointJson = pointSb.toString()
 
             withContext(Dispatchers.Main) {
@@ -252,7 +290,7 @@ class NativeMapView(private val context: Context) {
                     (s.getSource(SRC_POLY) as? GeoJsonSource)?.setGeoJson(polyJson)
                     (s.getSource(SRC_LINE) as? GeoJsonSource)?.setGeoJson(lineJson)
                     (s.getSource(SRC_POINT) as? GeoJsonSource)?.setGeoJson(pointJson)
-                    Log.d(TAG, "Updated map: poly=${polySb.length}, line=${lineSb.length}, point=${pointSb.length} chars")
+                    Log.d(TAG, "Updated map: poly=${polySb.length}, line=${lineJson.length}, point=${pointSb.length} chars")
 
                     // Add style99 raster layers for tiles that haven't been added yet
                     val n14 = 1 shl 14
@@ -335,6 +373,148 @@ class NativeMapView(private val context: Context) {
             Log.w(TAG, "Tile $key failed: ${e.message}")
             null
         }
+    }
+
+
+    /**
+     * Fetch road centerlines from OpenStreetMap Overpass API for the visible tile area.
+     * Returns a GeoJSON FeatureCollection string with LineString features and highway properties.
+     * 
+     * Uses OpenStreetMap data © OpenStreetMap contributors, ODbL license.
+     * Data fetched from https://overpass-api.de/api/interpreter
+     */
+    /** Cached OSM GeoJSON (loaded from asset on first call) */
+    private var cachedOsmGeoJson: String? = null
+    
+    private suspend fun fetchOsmRoads(xMin: Int, xMax: Int, yMin: Int, yMax: Int, zoom: Int): String? {
+        // Try bundled asset first (instant, no network needed)
+        if (cachedOsmGeoJson == null) {
+            cachedOsmGeoJson = try {
+                context.assets.open("prague_roads.geojson").bufferedReader().use { it.readText() }.also {
+                    Log.d(TAG, "OSM roads loaded from asset: ${it.length} chars")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "No bundled OSM asset: ${e.message}")
+                null
+            }
+        }
+        if (cachedOsmGeoJson != null) return cachedOsmGeoJson
+        
+        // Fallback: fetch from Overpass API
+        return try {
+            val n = 2.0.pow(zoom)
+            // Use tighter bbox (no padding) to reduce Overpass response size
+            val baseXMin = (xMin + 1).coerceAtMost(xMax)
+            val baseXMax = (xMax - 1).coerceAtLeast(xMin)
+            val baseYMin = (yMin + 1).coerceAtMost(yMax)
+            val baseYMax = (yMax - 1).coerceAtLeast(yMin)
+            val lonWest = (baseXMin.toDouble() / n * 360.0 - 180.0).format(5)
+            val lonEast = ((baseXMax + 1).toDouble() / n * 360.0 - 180.0).format(5)
+            val latSouth = tileYToLat(baseYMax + 1, zoom).format(5)
+            val latNorth = tileYToLat(baseYMin, zoom).format(5)
+            
+            val query = """[out:json][timeout:10];(way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified)$"]($latSouth,$lonWest,$latNorth,$lonEast););out geom;"""
+            
+            // Use java.net for simplicity (Ktor POST may require additional config)
+            val conn = java.net.URL("https://overpass-api.de/api/interpreter")
+                .openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.connectTimeout = 12000
+            conn.readTimeout = 12000
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+            conn.setRequestProperty("User-Agent", "AppleMapsAndroid/1.0")
+            Log.d(TAG, "OSM query for bbox: $latSouth,$lonWest,$latNorth,$lonEast")
+            val queryBytes = query.toByteArray(Charsets.UTF_8)
+            // Overpass API requires data=QUERY as URL-encoded form field
+            val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
+            val formData = "data=$encodedQuery".toByteArray(Charsets.UTF_8)
+            conn.outputStream.use { it.write(formData) }
+            val responseCode = conn.responseCode
+            if (responseCode != 200) {
+                val errText = conn.errorStream?.bufferedReader()?.readText()?.take(200) ?: "(no body)"
+                Log.w(TAG, "OSM HTTP $responseCode: $errText")
+                return null
+            }
+            val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+            Log.d(TAG, "OSM response: ${responseText.length} chars")
+            
+            // Parse JSON and convert to GeoJSON FeatureCollection
+            osmToGeoJson(responseText)
+        } catch (e: Exception) {
+            Log.w(TAG, "OSM fetch failed: ${e.message}")
+            null
+        }
+    }
+    
+    private fun tileYToLat(ty: Int, zoom: Int): Double {
+        val n = 2.0.pow(zoom)
+        return Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * ty / n))))
+    }
+    
+    private fun Double.format(decimals: Int) = "%.${decimals}f".format(java.util.Locale.US, this)
+    
+    /** Convert Overpass API JSON response to GeoJSON FeatureCollection */
+    private fun osmToGeoJson(overpassJson: String): String {
+        val sb = StringBuilder("""{"type":"FeatureCollection","features":[""")
+        var first = true
+        
+        try {
+            // Simple JSON parsing without full library — extract ways
+            val elementsStart = overpassJson.indexOf("\"elements\":")
+            if (elementsStart < 0) return """{"type":"FeatureCollection","features":[]}"""
+            
+            var pos = overpassJson.indexOf('[', elementsStart)
+            var depth = 0
+            val elements = StringBuilder()
+            while (pos < overpassJson.length) {
+                val ch = overpassJson[pos]
+                if (ch == '[' || ch == '{') depth++
+                if (ch == ']' || ch == '}') depth--
+                elements.append(ch)
+                pos++
+                if (depth == 0) break
+            }
+            
+            // Extract each way object
+            val wayRegex = Regex("""\{"type":"way".*?"geometry":\[.*?\]\}""", RegexOption.DOT_MATCHES_ALL)
+            for (match in wayRegex.findAll(overpassJson)) {
+                val wayStr = match.value
+                
+                // Extract highway tag
+                val hwMatch = Regex(""""highway":"([^"]+)"""").find(wayStr) ?: continue
+                val hw = hwMatch.groupValues[1]
+                
+                // Extract geometry array
+                val geomStart = wayStr.indexOf("\"geometry\":[")
+                if (geomStart < 0) continue
+                val geomEnd = wayStr.indexOf("]", geomStart + 12)
+                if (geomEnd < 0) continue
+                val geomStr = wayStr.substring(geomStart + 12, geomEnd)
+                
+                // Parse lat/lon pairs
+                val coords = StringBuilder()
+                var firstCoord = true
+                val nodeRegex = Regex(""""lat":(-?[0-9.]+),"lon":(-?[0-9.]+)""")
+                for (node in nodeRegex.findAll(geomStr)) {
+                    val lat = node.groupValues[1]; val lon = node.groupValues[2]
+                    if (!firstCoord) coords.append(',')
+                    coords.append("[$lon,$lat]")
+                    firstCoord = false
+                }
+                
+                if (firstCoord) continue  // no coords found
+                
+                if (!first) sb.append(',')
+                first = false
+                sb.append("""{"type":"Feature","geometry":{"type":"LineString","coordinates":[$coords]},"properties":{"highway":"$hw"}}""")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "OSM JSON parse error: ${e.message}")
+        }
+        
+        sb.append("]}")
+        return sb.toString()
     }
 
     // ── GeoJSON helpers ────────────────────────────────────────────
