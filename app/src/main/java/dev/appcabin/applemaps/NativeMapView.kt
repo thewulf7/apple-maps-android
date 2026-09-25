@@ -140,6 +140,35 @@ class NativeMapView(private val context: Context) {
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["tertiary","residential","unclassified"]]]""")))
+                // ── Labels ───────────────────────────────────────────────
+                // Road name labels — only on features that have a name property
+                // Use "has" filter to avoid crash on unnamed roads
+                style.addLayer(SymbolLayer("l-label-road-major", SRC_LINE).withProperties(
+                    PropertyFactory.textField(Expression.get("name")),
+                    PropertyFactory.textSize(11.5f),
+                    PropertyFactory.textColor("#4A4A40"),
+                    PropertyFactory.textHaloColor("#FFFDF8"),
+                    PropertyFactory.textHaloWidth(2.5f),
+                    PropertyFactory.symbolPlacement("line"),
+                    PropertyFactory.symbolSpacing(300.0f),
+                    PropertyFactory.textMaxAngle(30.0f),
+                    PropertyFactory.textOptional(true),
+                    PropertyFactory.textAllowOverlap(false),
+                    PropertyFactory.textFont(arrayOf("Open Sans Bold", "Arial Unicode MS Regular")),
+                ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["primary","secondary","trunk","motorway"]]]]""")))
+                style.addLayer(SymbolLayer("l-label-road-minor", SRC_LINE).withProperties(
+                    PropertyFactory.textField(Expression.get("name")),
+                    PropertyFactory.textSize(10.0f),
+                    PropertyFactory.textColor("#605E58"),
+                    PropertyFactory.textHaloColor("#FFFDF8"),
+                    PropertyFactory.textHaloWidth(2.0f),
+                    PropertyFactory.symbolPlacement("line"),
+                    PropertyFactory.symbolSpacing(400.0f),
+                    PropertyFactory.textMaxAngle(30.0f),
+                    PropertyFactory.textOptional(true),
+                    PropertyFactory.textAllowOverlap(false),
+                    PropertyFactory.textFont(arrayOf("Open Sans Regular", "Arial Unicode MS Regular")),
+                ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["tertiary","residential","unclassified"]]]]""")))
                 // POI points
                 style.addLayer(CircleLayer("l-point", SRC_POINT).withProperties(
                     PropertyFactory.circleRadius(2.5f),
@@ -626,5 +655,5 @@ class NativeMapView(private val context: Context) {
 }
 
 private val BLANK_STYLE = """
-{"version":8,"name":"Apple Maps","sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#F2EFE9"}}]}
+{"version":8,"name":"Apple Maps","glyphs":"https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf","sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#F2EFE9"}}]}
 """.trim()
