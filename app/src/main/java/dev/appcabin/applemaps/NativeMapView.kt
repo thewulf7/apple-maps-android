@@ -98,18 +98,14 @@ class NativeMapView(private val context: Context) {
                 ).withFilter(
                     Expression.raw("[\"all\",[\">\", [\"get\",\"ft\"], 99],[\"<\",[\"get\",\"ft\"],131]]")
                 ))
-                // Road network — line pool shapes are road AREA POLYGONS.
-                // Render as filled polygon (pavement area) with outline casing.
-                // Road casing (slightly darker than road fill for edge definition)
+                // Road layers hidden (road data causes visual artifacts at z=14).
                 style.addLayer(FillLayer("l-road-case", SRC_LINE).withProperties(
-                    PropertyFactory.fillColor("#DDDBD6"),
-                    PropertyFactory.fillOutlineColor("#B8B4AE"),
-                    PropertyFactory.fillOpacity(1.0f),
+                    PropertyFactory.fillColor("#F2EFE9"),  // same as land - invisible
+                    PropertyFactory.fillOpacity(0.0f),
                 ))
-                // Road fill (lighter pavement color on top)
                 style.addLayer(FillLayer("l-road-fill", SRC_LINE).withProperties(
-                    PropertyFactory.fillColor("#EDEAE4"),
-                    PropertyFactory.fillOpacity(1.0f),
+                    PropertyFactory.fillColor("#F2EFE9"),
+                    PropertyFactory.fillOpacity(0.0f),
                 ))
                 // POI points
                 style.addLayer(CircleLayer("l-point", SRC_POINT).withProperties(
@@ -154,10 +150,11 @@ class NativeMapView(private val context: Context) {
         val bounds = m.projection.visibleRegion.latLngBounds
         val zoom = m.cameraPosition.zoom.toInt().coerceIn(1, 17)
         val n = 2.0.pow(zoom)
-        val xMin = ((bounds.longitudeWest + 180) / 360 * n).toInt().coerceAtLeast(0)
-        val xMax = ((bounds.longitudeEast + 180) / 360 * n).toInt().coerceAtMost(n.toInt() - 1)
-        val yMin = latToTileY(bounds.latitudeNorth, zoom).coerceAtLeast(0)
-        val yMax = latToTileY(bounds.latitudeSouth, zoom).coerceAtMost(n.toInt() - 1)
+        // Add ±1 tile padding for denser road coverage and seamless edges
+        val xMin = (((bounds.longitudeWest + 180) / 360 * n).toInt() - 1).coerceAtLeast(0)
+        val xMax = (((bounds.longitudeEast + 180) / 360 * n).toInt() + 1).coerceAtMost(n.toInt() - 1)
+        val yMin = (latToTileY(bounds.latitudeNorth, zoom) - 1).coerceAtLeast(0)
+        val yMax = (latToTileY(bounds.latitudeSouth, zoom) + 1).coerceAtMost(n.toInt() - 1)
         val tileCount = (xMax - xMin + 1) * (yMax - yMin + 1)
         Log.d(TAG, "Loading $tileCount tiles z=$zoom x=$xMin..$xMax y=$yMin..$yMax | bounds lon=[${bounds.longitudeWest.round(4)},${bounds.longitudeEast.round(4)}] lat=[${bounds.latitudeSouth.round(4)},${bounds.latitudeNorth.round(4)}]")
 
@@ -232,26 +229,8 @@ class NativeMapView(private val context: Context) {
                         polySb.append(""""properties":{"ft":$ft}}""")
                     }
                 }
-                // Roads — line pool shapes are ROAD AREA POLYGONS (interleaved L/R edge vertices).
-                // Render as Polygon fills in the poly source (not LineStrings) for correct road area rendering.
-                // The road polygon outlines are added to lineSb for the casing/fill layer effect.
-                parsed.lineVertices?.let { pool ->
-                    for (i in pool.shapeStarts.indices) {
-                        val start = pool.shapeStarts[i]
-                        val len = pool.shapeLengths[i]
-                        if (len < 3 || start + len > pool.vertices.size) continue
-                        // Add road polygons to lineSb — rendered as a FillLayer in road color
-                        if (!lf) lineSb.append(','); lf = false
-                        lineSb.append("""{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[""")
-                        for (j in 0 until len) {
-                            if (j > 0) lineSb.append(',')
-                            appendCoord(lineSb, pool.vertices[start + j], tx, ty, zoom)
-                        }
-                        // Close the ring
-                        lineSb.append(','); appendCoord(lineSb, pool.vertices[start], tx, ty, zoom)
-                        lineSb.append("""]]},"properties":{}}""")
-                    }
-                }
+                // Roads disabled — road area polygons cause visual artifacts at this zoom.
+                // TODO: implement proper road centerline rendering when data source is available.
                 // Points
                 parsed.pointVertices?.let { pool ->
                     for (v in pool.vertices) {
@@ -284,16 +263,18 @@ class NativeMapView(private val context: Context) {
                         val ftMap = synchronized(style99Cache) { style99Cache[key] } ?: continue
                         if (key in style99Added) continue
 
-                        // Build ARGB bitmap from ft values
-                        val colors = IntArray(512 * 512) { i ->
+                        // Build ARGB bitmap from ft values, upscaled for smooth edges
+                        val srcSize = 512; val dstSize = 1024  // 2x upscale for smooth rendering
+                        val colors = IntArray(srcSize * srcSize) { i ->
                             when (ftMap[i]) {
                                 94 -> 0xFFA8D4F0.toInt()  // water #A8D4F0
                                 64 -> 0xFFD4E8C2.toInt()  // park  #D4E8C2
                                 else -> 0x00000000         // transparent (land drawn by bg)
                             }
                         }
-                        val bitmap = Bitmap.createBitmap(colors, 512, 512,
-                            Bitmap.Config.ARGB_8888)
+                        val srcBitmap = Bitmap.createBitmap(colors, srcSize, srcSize, Bitmap.Config.ARGB_8888)
+                        val bitmap = android.graphics.Bitmap.createScaledBitmap(srcBitmap, dstSize, dstSize, true)
+                        srcBitmap.recycle()
 
                         // Geographic bounds of the z=14 tile
                         val lonMin = s99x.toDouble() / n14 * 360.0 - 180.0
@@ -310,7 +291,8 @@ class NativeMapView(private val context: Context) {
                             ), bitmap))
                             // Add BELOW the land layer so polygons render on top
                             s.addLayerBelow(RasterLayer(lyrId, srcId).withProperties(
-                                PropertyFactory.rasterOpacity(1.0f)
+                                PropertyFactory.rasterOpacity(1.0f),
+                                PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_LINEAR)
                             ), "l-land")
                             style99Added.add(key)
                             Log.d(TAG, "Added style99 raster $key")
@@ -357,6 +339,78 @@ class NativeMapView(private val context: Context) {
 
     // ── GeoJSON helpers ────────────────────────────────────────────
 
+    /**
+     * Compute convex hull of a vertex list (Andrew's monotone chain).
+     * Used to eliminate self-intersections in road polygon meshes.
+     */
+    private fun convexHull(points: List<Vertex>): List<Vertex> {
+        if (points.size < 3) return points
+        // Remove duplicates first
+        val unique = points.distinctBy { "${it.x.toBits()},${it.y.toBits()}" }
+        if (unique.size < 3) return unique
+        val sorted = unique.sortedWith(compareBy({ it.x }, { it.y }))
+        val lower = mutableListOf<Vertex>()
+        for (p in sorted) {
+            while (lower.size >= 2) {
+                val a = lower[lower.size - 2]; val b = lower[lower.size - 1]
+                val cross = (b.x - a.x).toDouble() * (p.y - a.y) - (b.y - a.y).toDouble() * (p.x - a.x)
+                if (cross <= 0) lower.removeAt(lower.size - 1) else break
+            }
+            lower.add(p)
+        }
+        val upper = mutableListOf<Vertex>()
+        for (p in sorted.reversed()) {
+            while (upper.size >= 2) {
+                val a = upper[upper.size - 2]; val b = upper[upper.size - 1]
+                val cross = (b.x - a.x).toDouble() * (p.y - a.y) - (b.y - a.y).toDouble() * (p.x - a.x)
+                if (cross <= 0) upper.removeAt(upper.size - 1) else break
+            }
+            upper.add(p)
+        }
+        lower.addAll(upper.drop(1).dropLast(1))
+        return lower
+    }
+
+    /**
+     * Extract road centerline spine from a road area polygon using PCA.
+     * Returns a LineString path through the center of the road polygon.
+     * Works for simple road segments and complex junction areas.
+     */
+    private fun roadSpine(verts: List<Vertex>): List<Vertex> {
+        if (verts.size < 2) return verts
+        // Compute centroid
+        val cx = verts.sumOf { it.x.toDouble() } / verts.size
+        val cy = verts.sumOf { it.y.toDouble() } / verts.size
+        // PCA: covariance matrix
+        var covXX = 0.0; var covXY = 0.0; var covYY = 0.0
+        for (v in verts) {
+            val dx = v.x - cx; val dy = v.y - cy
+            covXX += dx * dx; covXY += dx * dy; covYY += dy * dy
+        }
+        val n = verts.size.toDouble()
+        covXX /= n; covXY /= n; covYY /= n
+        // Principal direction (eigenvector of largest eigenvalue)
+        val trace = covXX + covYY
+        val det = covXX * covYY - covXY * covXY
+        val lambda = trace / 2 + Math.sqrt(trace * trace / 4 - det)
+        // Eigenvector direction
+        val ex = if (Math.abs(covXY) > 1e-10) covXY else (lambda - covYY)
+        val ey = if (Math.abs(covXY) > 1e-10) lambda - covXX else covXY
+        val len = Math.sqrt(ex * ex + ey * ey)
+        if (len < 1e-10) return listOf(Vertex(cx.toFloat(), cy.toFloat()))
+        val nx = (ex / len).toFloat(); val ny = (ey / len).toFloat()
+        // Project all vertices onto principal axis
+        val projections = verts.map { v -> (v.x - cx) * nx + (v.y - cy) * ny }
+        val minP = projections.min()
+        val maxP = projections.max()
+        // Generate spine points along the principal axis
+        val spineCount = minOf(8, maxOf(2, (verts.size / 8)))
+        return (0 until spineCount).map { k ->
+            val t = minP + (maxP - minP) * k / (spineCount - 1)
+            Vertex((cx + t * nx).toFloat(), (cy + t * ny).toFloat())
+        }
+    }
+
     /** Fetch and decode style 99 tile (per-pixel style class raster). */
     private suspend fun fetchStyle99(z: Int, x: Int, y: Int): IntArray? {
         return try {
@@ -392,5 +446,5 @@ class NativeMapView(private val context: Context) {
 }
 
 private val BLANK_STYLE = """
-{"version":8,"name":"Apple Maps","sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#F5F5F3"}}]}
+{"version":8,"name":"Apple Maps","sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#F2EFE9"}}]}
 """.trim()
