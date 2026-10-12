@@ -189,14 +189,17 @@ private fun decodeVertexChapter(ch: ByteArray): VtxPool {
     val (rangeCount, p1) = readVarUint32(ch, pos);  pos = p1
     val (vertexCount, p2) = readVarUint32(ch, pos); pos = p2
 
-    // Preamble: MSB-first bitstream from pos
+    // Preamble: MSB-first bitstream, 17 bits total.
+    // Layout: coordBits(6) + rlenBits(6) + deltaBitsBits(4) + vertexType(1)
+    // normBits = coordBits (copy — NOT a separate bitstream field).
+    // From decodeVertices.c: reads 6+6+4+1 = 17 bits, then sets repeatedFirstSixBitValue = firstSixBitValue.
     val bs = BitReader(ch, pos * 8)
-    val coordBits  = bs.read(6)   // bit width for absolute coords
-    bs.read(6)                     // normalization_bits (unused for polyline)
-    val rlenBits   = bs.read(4)   // range_length_bits
-    val vertexType = bs.read(1)   // 0=polyline vector, 1=curve
-    val dbBits     = if (vertexType == 1) bs.read(4) else 4 // delta bits indicator (default 4 for polyline)
-    // preamble = 17 bits (polyline) or 21 bits (curve)
+    val coordBits  = bs.read(6)   // coordinate bits (absolute x/y)
+    val rlenBits   = bs.read(6)   // range_length_bits (extra-vertex count per range)
+    val dbBits     = bs.read(4)   // delta_bits_bits (bit width selector per range)
+    val vertexType = bs.read(1)   // 0=polyline, 1=curve
+    // normBits = coordBits (normalization denominator = (1 << coordBits) - 1)
+    // preamble = 17 bits always
 
     val normDenom = ((1L shl coordBits) - 1L).coerceAtLeast(1L)
 
@@ -226,7 +229,7 @@ private fun decodeVertexChapter(ch: ByteArray): VtxPool {
         }
     }
 
-    return VtxPool(vertices, ranges, coordBits, coordBits) // normBits = coordBits
+    return VtxPool(vertices, ranges, coordBits, coordBits) // normBits = coordBits (confirmed by decodeVertices.c)
 }
 
 // ─── Line feature decoder (_readLines) ───────────────────────────────────────
@@ -336,50 +339,76 @@ private fun decodePolygonFeatures(
 
     val features = mutableListOf<VectorTileFeature>()
 
-    // Emit every vtxPool range with ≥3 vertices as a polygon feature.
-    // Per-feature geometry mapping in the chapter is complex (run-segment reassembly);
-    // emitting all ranges directly produces correct polygon shapes without labels.
-    vtxPool?.let { pool ->
-        for (range in pool.ranges) {
-            if (range.count < 3) continue
-            val ring = (range.start until range.start + range.count).map { vi ->
-                val (vx, vy) = pool.vertices[vi]
-                tileNormToLatLon(tileX, tileY, tileZ, vx.toDouble() / normDenom, vy.toDouble() / normDenom)
-            }
-            if (ring.size >= 3) {
-                features.add(VectorTileFeature(featureType = featureType,
-                    geometry = listOf(ring), labels = emptyList(), shields = emptyList()))
-            }
-        }
-    }
-    return features
+    // Per-feature geometry: flags byte has BIT-REVERSED constants vs. C decompile.
+    // Empirically confirmed: 0x40=hasFeatureId(uint64), 0x08=hasInlineAttrs, etc.
+    // Bit mapping (actual byte bit → logical field):
+    //   bit7(0x80) = hasPointCount    (decompile: 0x01)
+    //   bit6(0x40) = hasFeatureId     (decompile: 0x02, uint64 8B)
+    //   bit5(0x20) = hasSortKey       (decompile: 0x04, varint)
+    //   bit4(0x10) = hasDispPriority  (decompile: 0x08, 4B float)
+    //   bit3(0x08) = hasInlineAttrs   (decompile: 0x10, accumulateStyleAttributes)
+    //   bit2(0x04) = hasBuildingFlag  (decompile: 0x20, varint)
+    var rp = 0  // running range pointer into vtxPool.ranges
 
-    @Suppress("UNREACHABLE_CODE")
     for (i in 0 until featureCount.toInt()) {
-        // Per-feature: hp_readLabel (label offset+length varints) + polygon geometry index
-        val (strOff, p5) = readVarUint32(polyCh, pos); pos = p5
-        val (strLen, p6) = readVarUint32(polyCh, pos); pos = p6
-        val labelText = if (strOff < stringPool.size && strOff > 0L) {
-            if (strLen == 0L) readNullTermStr(stringPool, strOff.toInt())
-            else String(stringPool, strOff.toInt(), strLen.toInt().coerceAtMost(stringPool.size - strOff.toInt()), Charsets.UTF_8)
-        } else ""
+        if (pos >= polyCh.size) break
 
+        // hp_readLabel: encodedLabelCount (LEB128) + N×(textOffset + unusedValue) LEB128 pairs
+        val (encodedLabelCount, p5) = readVarUint32(polyCh, pos); pos = p5
+        val labelCount = encodedLabelCount.toInt()
+        val labels = mutableListOf<String>()
+        for (j in 0 until labelCount) {
+            val (strOff, p6) = readVarUint32(polyCh, pos); pos = p6
+            val (_, p7)      = readVarUint32(polyCh, pos); pos = p7 // unusedValue
+            val labelText = if (strOff > 0L && strOff < stringPool.size) {
+                readNullTermStr(stringPool, strOff.toInt())
+            } else ""
+            if (labelText.isNotEmpty()) labels.add(labelText)
+        }
+
+        if (pos >= polyCh.size) break
+        val flags = polyCh[pos++].toInt() and 0xff
+
+        // pointCount: how many consecutive vtxPool ranges belong to this feature
+        var pc = 1
+        if (flags and 0x80 != 0) {
+            val (pcV, p8) = readVarUint32(polyCh, pos); pos = p8; pc = pcV.toInt().coerceAtLeast(1)
+        }
+        if (flags and 0x40 != 0) { pos += 8 }  // featureId (uint64, 8 bytes)
+        if (flags and 0x20 != 0) { val (_, px) = readVarUint32(polyCh, pos); pos = px } // sortKey
+        if (flags and 0x10 != 0) { pos += 4 }  // dispPriority (float, 4 bytes)
+        if (flags and 0x08 != 0) {              // inlineStyleAttributes (accumulateStyleAttributes)
+            val (addCnt, p9) = readVarUint32(polyCh, pos); pos = p9
+            repeat(addCnt.toInt()) { val (_, pa) = readVarUint32(polyCh, pos); pos = pa; val (_, pb) = readVarUint32(polyCh, pos); pos = pb }
+            val (remCnt, pc2) = readVarUint32(polyCh, pos); pos = pc2
+            repeat(remCnt.toInt()) { val (_, pd) = readVarUint32(polyCh, pos); pos = pd }
+        }
+        if (flags and 0x04 != 0) { val (_, pe) = readVarUint32(polyCh, pos); pos = pe } // buildingFlag
+
+        // Geometry: pc consecutive ranges from vtxPool (outer ring + optional inner rings)
         val geometry = mutableListOf<List<LatLon>>()
         vtxPool?.let { pool ->
-            if (i < pool.ranges.size) {
-                val range = pool.ranges[i]
-                val ring = (range.start until range.start + range.count)
-                    .map { vi ->
-                        val (vx, vy) = pool.vertices[vi]
-                        tileNormToLatLon(tileX, tileY, tileZ, vx.toDouble() / normDenom, vy.toDouble() / normDenom)
-                    }
-                if (ring.size >= 3) geometry.add(ring)
+            for (ri in rp until (rp + pc)) {
+                if (ri >= pool.ranges.size) break
+                val range = pool.ranges[ri]
+                if (range.count < 2) continue
+                val ring = (range.start until range.start + range.count).map { vi ->
+                    val (vx, vy) = pool.vertices[vi]
+                    tileNormToLatLon(tileX, tileY, tileZ, vx.toDouble() / normDenom, vy.toDouble() / normDenom)
+                }
+                if (ring.size >= 2) geometry.add(ring)
             }
         }
+        rp += pc
 
-        val labels = if (labelText.isNotEmpty()) listOf(labelText) else emptyList()
-        features.add(VectorTileFeature(featureType = featureType, geometry = geometry, labels = labels, shields = emptyList()))
+        features.add(VectorTileFeature(
+            featureType = featureType,
+            geometry    = geometry,
+            labels      = labels,
+            shields     = emptyList(),
+        ))
     }
+    Log.d(TAG, "decodePolyFeatures: fc=$featureCount got=${features.size} rp=$rp pos=$pos/${polyCh.size}")
     return features
 }
 

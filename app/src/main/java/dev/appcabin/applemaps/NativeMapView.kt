@@ -912,7 +912,7 @@ class NativeMapView(private val context: Context,
 
     /** Fetch + decode a VMP4 tile using the validated real-format decoder */
     private suspend fun fetchAndParseVmp4(z: Int, x: Int, y: Int, style: Int = 1): VectorTile? {
-        val key = "$z/$x/$y/s${style}_v2"
+        val key = "$z/$x/$y/s${style}_v3"
         synchronized(tileCache) { tileCache[key] }?.let { return it }
         return try {
             val assetName = "tile_${z}_${x}_${y}_s${style}.bin"
