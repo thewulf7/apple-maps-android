@@ -9,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -40,6 +41,7 @@ import kotlinx.coroutines.launch
 // Apple Maps iOS colour tokens
 object AppleColors {
     val Blue = Color(0xFF007AFF)
+    val Tint = Color(0xFF007AFF)   // same as Blue — named for intent clarity
     val Red = Color(0xFFFF3B30)
     val SearchFieldBg = Color(0xFFE9E9EB)
     val TextPrimary = Color(0xFF000000)
@@ -146,8 +148,8 @@ fun AppleMapsScreen(
     var mapStyle by remember { mutableStateOf("standard") }
     var searchQuery by remember { mutableStateOf("") }
     var searchResults by remember { mutableStateOf<List<AppleMapSearch.SearchResult>>(emptyList()) }
-    var mapCenter by remember { mutableStateOf(LatLng(50.0755, 14.4378)) }
-    var mapZoom by remember { mutableStateOf(14f) }
+    var mapCenter by remember { mutableStateOf(LatLng(50.0860, 14.4115)) }
+    var mapZoom by remember { mutableStateOf(15f) }
     var userLocation by remember { mutableStateOf<LatLng?>(null) }
     var searchPin by remember { mutableStateOf<LatLng?>(null) }
     var selectedPlace by remember { mutableStateOf<AppleMapSearch.SearchResult?>(null) }
@@ -160,12 +162,13 @@ fun AppleMapsScreen(
         )
     )
 
-    // GPS on launch
+    // GPS on launch — only update userLocation (blue dot), do NOT move mapCenter
+    // User must tap the locate button to fly to their position
     LaunchedEffect(Unit) {
         if (hasLocationPermission()) {
             getLastLocation { loc ->
                 userLocation = loc
-                mapCenter = loc
+                // mapCenter intentionally NOT updated here — start at Prague
             }
         }
     }
@@ -278,6 +281,14 @@ fun AppleMapsScreen(
                                             focusManager.clearFocus()
                                         },
                                 )
+                            } else {
+                                // Mic icon (Apple Maps dictation button)
+                                Icon(
+                                    Icons.Default.Mic,
+                                    contentDescription = "Dictate",
+                                    tint = AppleColors.TextTertiary,
+                                    modifier = Modifier.size(18.dp),
+                                )
                             }
                         }
                     }
@@ -359,13 +370,15 @@ fun AppleMapsScreen(
                 },
             )
 
-            // ===== Top-right map controls (iOS capsule) =====
+            // ===== Map controls — top-right: layers capsule (Apple style) =====
             Column(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .statusBarsPadding()
                     .padding(top = 8.dp, end = 12.dp),
+                verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp),
             ) {
+                // Layers + Locate in one capsule (matches Apple Maps top-right)
                 MapControlCapsule {
                     MapControlButton(Icons.Outlined.Layers) {
                         mapStyle = when (mapStyle) {
@@ -379,7 +392,8 @@ fun AppleMapsScreen(
                         thickness = 0.5.dp,
                         color = AppleColors.Separator,
                     )
-                    MapControlButton(Icons.Outlined.NearMe) {
+                    // Locate button — blue tint when active (Apple style)
+                    MapControlButton(Icons.Outlined.NearMe, tint = AppleColors.Tint) {
                         if (hasLocationPermission()) {
                             getLastLocation { loc ->
                                 userLocation = loc
@@ -399,6 +413,76 @@ fun AppleMapsScreen(
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // ===== Top-left: Weather widget (Apple Maps style frosted card) =====
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .statusBarsPadding()
+                    .padding(start = 12.dp, top = 8.dp),
+            ) {
+                Surface(
+                    modifier = Modifier.shadow(3.dp, RoundedCornerShape(10.dp)),
+                    shape = RoundedCornerShape(10.dp),
+                    color = AppleColors.ControlBg.copy(alpha = 0.92f),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Default.Cloud,
+                                contentDescription = null,
+                                tint = AppleColors.TextSecondary,
+                                modifier = Modifier.size(14.dp),
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = "17°",
+                                style = androidx.compose.material3.MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                                    fontSize = 18.sp,
+                                ),
+                                color = AppleColors.TextPrimary,
+                            )
+                        }
+                        Text(
+                            text = "AQI 23",
+                            style = androidx.compose.material3.MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 9.sp,
+                                letterSpacing = 0.3.sp,
+                            ),
+                            color = Color(0xFF34C759), // Apple green = good air quality
+                        )
+                    }
+                }
+            }
+
+            // ===== Bottom-left: Look Around (binoculars) button =====
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .navigationBarsPadding()
+                    .padding(start = 12.dp, bottom = 120.dp),
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .size(44.dp)
+                        .shadow(4.dp, CircleShape),
+                    shape = CircleShape,
+                    color = AppleColors.ControlBg,
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Outlined.Explore,
+                            contentDescription = "Look Around",
+                            tint = AppleColors.TextPrimary,
+                            modifier = Modifier.size(20.dp),
+                        )
                     }
                 }
             }
@@ -425,7 +509,7 @@ fun MapControlCapsule(content: @Composable ColumnScope.() -> Unit) {
 }
 
 @Composable
-fun MapControlButton(icon: ImageVector, onClick: () -> Unit) {
+fun MapControlButton(icon: ImageVector, tint: Color = Color(0xFF3C3C43), onClick: () -> Unit) {
     IconButton(
         onClick = onClick,
         modifier = Modifier.size(40.dp),
@@ -433,7 +517,7 @@ fun MapControlButton(icon: ImageVector, onClick: () -> Unit) {
         Icon(
             icon,
             contentDescription = null,
-            tint = Color(0xFF3C3C43),
+            tint = tint,
             modifier = Modifier.size(20.dp),
         )
     }
@@ -628,35 +712,68 @@ fun PlaceDetailContent(
 
 @Composable
 fun FavoritesSection() {
+    // Apple Maps style: quick-access grid without "Favourites/More" header
+    // Just the icon shortcuts row like Apple Maps bottom sheet
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .padding(horizontal = 16.dp, vertical = 4.dp)
     ) {
+        // Drag handle (Apple Maps has a pill-shaped handle at top of sheet)
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 4.dp),
+            horizontalArrangement = Arrangement.Center
         ) {
-            Text(
-                "Favourites",
-                fontSize = 13.sp,
-                color = AppleColors.TextSecondary,
-                fontWeight = FontWeight.Medium,
-            )
-            Text(
-                "More",
-                fontSize = 13.sp,
-                color = AppleColors.Blue,
+            Box(
+                modifier = Modifier
+                    .width(36.dp)
+                    .height(4.dp)
+                    .background(
+                        AppleColors.Separator,
+                        shape = RoundedCornerShape(2.dp),
+                    )
             )
         }
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(8.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(24.dp),
+            horizontalArrangement = Arrangement.spacedBy(20.dp),
         ) {
             FavoriteItem(Icons.Filled.Home, "Home", "Add")
             FavoriteItem(Icons.Filled.Work, "Work", "Add")
+            FavoriteItem(Icons.Filled.DirectionsCar, "Recent", null)
             FavoriteItem(Icons.Default.Add, "Add", null)
+        }
+        Spacer(modifier = Modifier.height(20.dp))
+        // Section header: "Recents" like Apple Maps
+        Text(
+            "Recents",
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = AppleColors.TextPrimary,
+            modifier = Modifier.padding(bottom = 8.dp),
+        )
+        // Placeholder recent entry (Charles Bridge)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(vertical = 8.dp),
+        ) {
+            Surface(
+                modifier = Modifier.size(36.dp),
+                shape = CircleShape,
+                color = AppleColors.SearchFieldBg,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Place, null, tint = AppleColors.TextTertiary, modifier = Modifier.size(18.dp))
+                }
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column {
+                Text("Charles Bridge", fontSize = 15.sp, color = AppleColors.TextPrimary)
+                Text("Staré Město, Prague", fontSize = 12.sp, color = AppleColors.TextSecondary)
+            }
         }
     }
 }

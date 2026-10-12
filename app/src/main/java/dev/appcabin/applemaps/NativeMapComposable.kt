@@ -22,7 +22,9 @@ fun NativeMapComposable(
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
-    val nativeMap = remember { NativeMapView(context) }
+    val initCenter = remember { center }
+    val initZoom = remember { zoom }
+    val nativeMap = remember { NativeMapView(context, initCenter.lat, initCenter.lng, initZoom.toDouble()) }
 
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->

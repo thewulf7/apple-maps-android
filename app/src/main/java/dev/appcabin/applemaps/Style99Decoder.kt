@@ -41,10 +41,12 @@ object Style99Decoder {
      *   4 = shore/riverbank      → ft 94 → #A8D4F0 blue (water variant)
      */
     private val CLASS_TO_FT = IntArray(256) { 0 }.also { a ->
-        a[1] = 94  // water
-        a[2] = 64  // park
-        a[3] = 94  // water variant
-        a[4] = 94  // water variant
+        a[1] = 94  // water (river/lake)
+        a[2] = 64  // park / green space
+        a[3] = 94  // water variant (river surface)
+        a[4] = 94  // water variant (shore/edge)
+        // Vals 5-20 are urban land classes → remain ft=0 (land)
+        // Val 10 appears to be a green/park variant in some tiles
     }
 
     /**

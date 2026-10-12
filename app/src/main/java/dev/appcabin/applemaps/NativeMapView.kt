@@ -32,7 +32,10 @@ import kotlin.math.pow
  * ponytail: fetches style 1 (buildings/polygons) + style 20 (road network)
  * and merges them into a single render.
  */
-class NativeMapView(private val context: Context) {
+class NativeMapView(private val context: Context,
+                    private val initLat: Double = 50.0868,
+                    private val initLon: Double = 14.4115,
+                    private val initZoom: Double = 15.0) {
 
     companion object {
         private const val TAG = "NativeMapView"
@@ -44,8 +47,8 @@ class NativeMapView(private val context: Context) {
     private val client = HttpClient()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var map: MapLibreMap? = null
-    private val tileCache = object : LinkedHashMap<String, ParsedTile>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ParsedTile>?) = size > 256
+    private val tileCache = object : LinkedHashMap<String, VectorTile>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, VectorTile>?) = size > 256
     }
     /** Per-tile style 99 ft maps: key="z/x/y", value=IntArray[512*512] of ft values */
     private val style99Cache = object : LinkedHashMap<String, IntArray>(64, 0.75f, true) {
@@ -85,142 +88,335 @@ class NativeMapView(private val context: Context) {
                     style.addSource(GeoJsonSource(SRC_WATER, waterGeoJson))
                     Log.d(TAG, "Water source added with ${waterGeoJson.length} chars")
                 }
+                // OSM park polygons (parks, gardens, grass areas)
+                val parkGeoJson = try {
+                    context.assets.open("prague_parks.geojson").bufferedReader().use { it.readText() }
+                } catch (e: Exception) { Log.w(TAG, "Parks load failed: ${e.message}"); null }
+                val SRC_PARKS = "osm-parks"
+                if (parkGeoJson != null) {
+                    style.addSource(GeoJsonSource(SRC_PARKS, parkGeoJson))
+                    Log.d(TAG, "Parks source added: ${parkGeoJson.length} chars")
+                }
+                // OSM building footprints (Staré Město + Malá Strana + Josefov center)
+                val buildingGeoJson = try {
+                    context.assets.open("prague_buildings.geojson").bufferedReader().use { it.readText() }
+                } catch (e: Exception) { Log.w(TAG, "Buildings load failed: ${e.message}"); null }
+                val SRC_BLDG = "osm-buildings"
+                if (buildingGeoJson != null) {
+                    style.addSource(GeoJsonSource(SRC_BLDG, buildingGeoJson))
+                    Log.d(TAG, "Buildings source added: ${buildingGeoJson.length} chars")
+                }
+                // OSM POIs (restaurants, museums, attractions, hotels)
+                val poisGeoJson = try {
+                    context.assets.open("prague_pois.geojson").bufferedReader().use { it.readText() }
+                } catch (e: Exception) { Log.w(TAG, "POIs load failed: ${e.message}"); null }
+                val SRC_POI = "osm-pois"
+                if (poisGeoJson != null) {
+                    style.addSource(GeoJsonSource(SRC_POI, poisGeoJson))
+                    Log.d(TAG, "POIs source added: ${poisGeoJson.length} chars")
+                }
+
+                val pedGeoJson = try {
+                    context.assets.open("prague_pedestrian.geojson").bufferedReader().use { it.readText() }
+                } catch (e: Exception) { Log.w(TAG, "Pedestrian load failed: ${e.message}"); null }
+                val SRC_PED = "osm-pedestrian"
+                if (pedGeoJson != null) {
+                    style.addSource(GeoJsonSource(SRC_PED, pedGeoJson))
+                    Log.d(TAG, "Pedestrian source added: ${pedGeoJson.length} chars")
+                }
+                // Area labels: park names + water names (Vltava etc.)
+                val areaLabelsGeoJson = try {
+                    context.assets.open("prague_area_labels.geojson").bufferedReader().use { it.readText() }
+                } catch (e: Exception) { Log.w(TAG, "Area labels load failed: ${e.message}"); null }
+                val SRC_AREA_LABELS = "osm-area-labels"
+                if (areaLabelsGeoJson != null) {
+                    style.addSource(GeoJsonSource(SRC_AREA_LABELS, areaLabelsGeoJson))
+                    Log.d(TAG, "Area labels source added: ${areaLabelsGeoJson.length} chars")
+                }
 
                 // Polygon fills — Apple Maps color palette by feature type
                 // ponytail: separate sources per feature class beats data-driven for clarity
                 // ft=0: land/ground, ft=64-69: parks/recreation, ft=90-99: water
                 // Base land fill (covers everything)
                 style.addLayer(FillLayer("l-land", SRC_POLY).withProperties(
-                    PropertyFactory.fillColor("#F2EFE9"),
+                    PropertyFactory.fillColor("#F9F5ED"),  // VectorKit land-fill extracted from binary
                     PropertyFactory.fillOpacity(1.0f),
                 ))
-                // OSM vector water — disabled (geom issues with large river polygons)
-                // style.addLayer(FillLayer("l-water-osm", SRC_WATER)...)
+                // OSM vector water — cleaned (fountains removed), Vltava 1175pts + 32 islands
+                if (waterGeoJson != null) {
+                    style.addLayer(FillLayer("l-water-osm", SRC_WATER).withProperties(
+                        PropertyFactory.fillColor("#B5D8EA"),   // Water — soft steel blue (Apple Maps calibrated)
+                        PropertyFactory.fillOpacity(1.0f),
+                        PropertyFactory.fillAntialias(true),
+                    ))
+                    // Water edge stroke — thin darker blue outline (Apple Maps riverbank style)
+                    style.addLayer(LineLayer("l-water-edge", SRC_WATER).withProperties(
+                        PropertyFactory.lineColor("#78B8D2"),   // slightly darker than fill
+                        PropertyFactory.lineWidth(0.9f),
+                        PropertyFactory.lineOpacity(0.6f),
+                        PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                        PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                    ))
+                }
 
-                // Parks — green
-                // Use Expression.raw() — Expression.literal(int) type-mismatches JSON double ft values
-                style.addLayer(FillLayer("l-park", SRC_POLY).withProperties(
-                    PropertyFactory.fillColor("#D4E8C2"),
-                    PropertyFactory.fillOpacity(1.0f),
-                ).withFilter(
-                    Expression.raw("[\"in\",[\"get\",\"ft\"],[\"literal\",[40,64,65]]]")
-                ))
-                // Water — blue
-                style.addLayer(FillLayer("l-water", SRC_POLY).withProperties(
-                    PropertyFactory.fillColor("#A8D4F0"),
-                    PropertyFactory.fillOpacity(1.0f),
-                ).withFilter(
-                    Expression.raw("[\"in\",[\"get\",\"ft\"],[\"literal\",[88,89,90,91,92,93,94,95,96,97,98,99,100]]]")
-                ))
-                // Buildings — warm beige
+                // Green space: parks, gardens, grass (lighter green)
+                if (parkGeoJson != null) {
+                    style.addLayer(FillLayer("l-park-osm", SRC_PARKS).withProperties(
+                        PropertyFactory.fillColor("#C4D9A8"),   // Park — display-calibrated sage (VK #B4D48D too vivid on screen)
+                        PropertyFactory.fillOpacity(1.0f),
+                        PropertyFactory.fillAntialias(true),
+                    ))
+                    // Forests/woods on top of parks — slightly darker green
+                    style.addLayer(FillLayer("l-forest-osm", SRC_PARKS).withProperties(
+                        PropertyFactory.fillColor("#9DC8A8"),   // Forest — muted teal-green (was #8DD4B4, too bright)
+                        PropertyFactory.fillOpacity(1.0f),
+                        PropertyFactory.fillAntialias(true),
+                    ).withFilter(
+                        Expression.raw("""["in",["get","ftype"],["literal",["forest","wood","scrub"]]]""")
+                    ))
+                    // Park outline — thin green border (Apple Maps style)
+                    style.addLayer(LineLayer("l-park-outline", SRC_PARKS).withProperties(
+                        PropertyFactory.lineColor("#8DB87A"),   // medium green — subtle park edge
+                        PropertyFactory.lineWidth(0.6f),
+                        PropertyFactory.lineOpacity(0.5f),
+                    ))
+                }
+                // VMP4-based park layer (fallback, less accurate)
+                // style.addLayer(FillLayer("l-park", SRC_POLY).withProperties(...
+                // VMP4 polygon centroid sampling occasionally misclassifies → garbled green/blue blobs.
+                // The style99 raster (placed above l-land) handles both water and park coloring.
+                // style.addLayer(FillLayer("l-park", SRC_POLY).withProperties(
+                //     PropertyFactory.fillColor("#B9D89B"),
+                //     PropertyFactory.fillOpacity(1.0f),
+                // ).withFilter(
+                //     Expression.raw("[\"in\",[\"get\",\"ft\"],[\"literal\",[40,64,65]]]")
+                // ))
+                // Water — blue (also disabled, handled by style99 raster)
+                // style.addLayer(FillLayer("l-water", SRC_POLY).withProperties(...)
+                // VMP4 small polygons (embankments, island shores, park features) — subtle render
+                // These are small geographic features, not individual buildings.
+                // Buildings require OSM data or z16 VMP4 tiles — deferred.
                 style.addLayer(FillLayer("l-building", SRC_POLY).withProperties(
-                    PropertyFactory.fillColor("#E0D8CC"),
+                    PropertyFactory.fillColor("#EDE7DC"),       // very slightly darker than land
                     PropertyFactory.fillOpacity(1.0f),
-                    PropertyFactory.fillOutlineColor("#C8C0B4"),
+                    PropertyFactory.fillOutlineColor("#C8C0B4"), // subtle gray outline
+                    PropertyFactory.fillAntialias(true),
                 ).withFilter(
-                    Expression.raw("[\"all\",[\">\", [\"get\",\"ft\"], 99],[\"<\",[\"get\",\"ft\"],131]]")
+                    Expression.raw("""["<",["get","am"],20000]""")
                 ))
-                // Road network from OSM — Apple Maps style hierarchy
+                // Known detected VMP4 types (when ft is correctly decoded) get more contrast
+                style.addLayer(FillLayer("l-building-detected", SRC_POLY).withProperties(
+                    PropertyFactory.fillColor("#E2D9CE"),
+                    PropertyFactory.fillOpacity(1.0f),
+                    PropertyFactory.fillOutlineColor("#B8B0A4"),
+                    PropertyFactory.fillAntialias(true),
+                ).withFilter(
+                    Expression.raw("""[">=",["get","ft"],100]""")
+                ))
+                // OSM building footprints — strong contrast vs land (#F0EBE3) for urban texture
+                if (buildingGeoJson != null) {
+                    style.addLayer(FillLayer("l-osm-buildings", SRC_BLDG).withProperties(
+                        PropertyFactory.fillColor("#E2D8CE"),   // Apple Maps: warm light gray-beige buildings
+                        PropertyFactory.fillOpacity(0.65f),
+                        PropertyFactory.fillOutlineColor("#C8BEB4"), // subtle darker outline
+                        PropertyFactory.fillAntialias(true),
+                    ))
+                }
+                // Bridge + pedestrian layer
+                // Apple Maps: Charles Bridge = thin white line across water, same style as pedestrian streets on land
+                if (pedGeoJson != null) {
+                    // Casing (slightly wider, darker edge)
+                    style.addLayer(LineLayer("l-bridge-case", SRC_PED).withProperties(
+                        PropertyFactory.lineColor("#D0C8BC"),
+                        PropertyFactory.lineWidth(
+                            Expression.interpolate(Expression.linear(), Expression.zoom(),
+                                Expression.stop(13, 3.5f), Expression.stop(15, 6f), Expression.stop(17, 10f))),
+                        PropertyFactory.lineCap("round"),
+                        PropertyFactory.lineJoin("round"),
+                    ).withFilter(Expression.raw("""["in",["get","name"],["literal",["Karlův most","most Legií","Čechův most","Štefánikův most","Mánesův most","Palacký most"]]]""")))
+
+                    // Fill (white/near-white, same as pedestrian streets on land)
+                    style.addLayer(LineLayer("l-bridge-fill", SRC_PED).withProperties(
+                        PropertyFactory.lineColor("#F7F4EF"),
+                        PropertyFactory.lineWidth(
+                            Expression.interpolate(Expression.linear(), Expression.zoom(),
+                                Expression.stop(13, 2f), Expression.stop(15, 4f), Expression.stop(17, 7f))),
+                        PropertyFactory.lineCap("round"),
+                        PropertyFactory.lineJoin("round"),
+                    ).withFilter(Expression.raw("""["in",["get","name"],["literal",["Karlův most","most Legií","Čechův most","Štefánikův most","Mánesův most","Palacký most"]]]""")))
+
+                    // Pedestrian streets (non-bridge) — warm white thin lines
+                    style.addLayer(LineLayer("l-ped-case", SRC_PED).withProperties(
+                        PropertyFactory.lineColor("#C8C0B4"),   // warm gray casing
+                        PropertyFactory.lineWidth(
+                            Expression.interpolate(Expression.linear(), Expression.zoom(),
+                                Expression.stop(13, 1.5f), Expression.stop(15, 3.5f), Expression.stop(17, 6f))),
+                        PropertyFactory.lineCap("round"),
+                        PropertyFactory.lineJoin("round"),
+                    ).withFilter(Expression.raw("""["!",["in",["get","name"],["literal",["Karlův most","most Legií","Čechův most","Štefánikův most","Mánesův most","Palacký most"]]]]""")))
+                    style.addLayer(LineLayer("l-ped-fill", SRC_PED).withProperties(
+                        PropertyFactory.lineColor("#F4EFE9"),   // very warm near-white — lighter than land, same as Apple pedestrian
+                        PropertyFactory.lineWidth(
+                            Expression.interpolate(Expression.linear(), Expression.zoom(),
+                                Expression.stop(13, 1f), Expression.stop(15, 2.5f), Expression.stop(17, 4.5f))),
+                        PropertyFactory.lineCap("round"),
+                        PropertyFactory.lineJoin("round"),
+                    ).withFilter(Expression.raw("""["!",["in",["get","name"],["literal",["Karlův most","most Legií","Čechův most","Štefánikův most","Mánesův most","Palacký most"]]]]""")))
+                }
+
+                // Road network — aggressive Apple Maps-style hierarchy
+                // KEY: primary roads are CREAM/WARM WHITE, residential are COOL GRAY
+                // This color distinction is as important as width for hierarchy
+
                 // Layer 1: Motorways/trunk (yellow, thick)
                 style.addLayer(LineLayer("l-road-hw-case", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#E6AD30"),
-                    PropertyFactory.lineWidth(10.0f),
+                    PropertyFactory.lineColor("#C8940A"),
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(10, 6f), Expression.stop(14, 14f), Expression.stop(16, 22f))),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["motorway","trunk"]]]""")))
                 style.addLayer(LineLayer("l-road-hw", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#F5C850"),
-                    PropertyFactory.lineWidth(7.0f),
+                    PropertyFactory.lineColor("#F0BB28"),
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(10, 4f), Expression.stop(14, 10f), Expression.stop(16, 17f))),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["motorway","trunk"]]]""")))
-                // Layer 2: Primary roads (thick white)
+
+                // Layer 2: Primary — warm cream/white with thick casing (clearly wider than residential)
                 style.addLayer(LineLayer("l-road-primary-case", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#D0CDBF"),
-                    PropertyFactory.lineWidth(8.0f),
+                    PropertyFactory.lineColor("#94907F"),  // VectorKit road-casing
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(10, 4f), Expression.stop(14, 14f), Expression.stop(16, 20f))),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["primary","secondary"]]]""")))
+                ).withFilter(Expression.raw("""["==",["get","highway"],"primary"]""")))
                 style.addLayer(LineLayer("l-road-primary", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#FFFFFF"),
-                    PropertyFactory.lineWidth(5.5f),
+                    PropertyFactory.lineColor("#FFFEF5"),  // warm white
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(10, 2f), Expression.stop(14, 10f), Expression.stop(16, 16f))),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["primary","secondary"]]]""")))
-                // Layer 3: Tertiary (medium) and Residential (thin) — clear hierarchy
+                ).withFilter(Expression.raw("""["==",["get","highway"],"primary"]""")))
+
+                // Layer 2b: Secondary — slightly thinner than primary
+                style.addLayer(LineLayer("l-road-secondary-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#B0A898"),  // VectorKit road-casing secondary
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(10, 2.5f), Expression.stop(14, 10f), Expression.stop(16, 15f))),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["==",["get","highway"],"secondary"]""")))
+                style.addLayer(LineLayer("l-road-secondary", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#FFFEF5"),  // same warm white
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(10, 1.5f), Expression.stop(14, 7f), Expression.stop(16, 12f))),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["==",["get","highway"],"secondary"]""")))
+
+                // Layer 3: Tertiary
                 style.addLayer(LineLayer("l-road-tertiary-case", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#D0CDBC"),
-                    PropertyFactory.lineWidth(3.5f),
+                    PropertyFactory.lineColor("#C0BAB0"),  // VectorKit road-casing tertiary
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(12, 2f), Expression.stop(14, 7f), Expression.stop(16, 10f))),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ).withFilter(Expression.raw("""["==",["get","highway"],"tertiary"]""")))
                 style.addLayer(LineLayer("l-road-tertiary", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#FFFFFF"),
-                    PropertyFactory.lineWidth(2.5f),
+                    PropertyFactory.lineColor("#FEFEF8"),
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(12, 1f), Expression.stop(14, 5f), Expression.stop(16, 7.5f))),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ).withFilter(Expression.raw("""["==",["get","highway"],"tertiary"]""")))
-                // Residential: very thin, just barely visible
+
+                // Layer 4: Residential — COOL GRAY fill (distinguishable from warm white primaries)
                 style.addLayer(LineLayer("l-road-case", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#D8D5CC"),
-                    PropertyFactory.lineWidth(2.5f),
+                    PropertyFactory.lineColor("#D0CBC4"),  // VectorKit road-casing residential (lightest)
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 1.5f), Expression.stop(14, 4f), Expression.stop(16, 6f))),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["residential","unclassified"]]]""")))
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["residential","unclassified","service"]]]""")))
                 style.addLayer(LineLayer("l-road-fill", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#FFFFFF"),
-                    PropertyFactory.lineWidth(1.5f),
+                    PropertyFactory.lineColor("#F4F2F0"),  // slightly gray-white (vs warm #FFFEF5)
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 0.5f), Expression.stop(14, 2.5f), Expression.stop(16, 4f))),
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["residential","unclassified"]]]""")))
-                // ── Labels ───────────────────────────────────────────────
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["residential","unclassified","service"]]]""")))
+                // Service / living_street — even narrower, same fill colour, on top
+                style.addLayer(LineLayer("l-road-service-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#D8D4CF"),  // slightly lighter casing for service lanes
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 0.8f), Expression.stop(14, 2.5f), Expression.stop(16, 4.5f))),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["service","living_street"]]]""")))
+                style.addLayer(LineLayer("l-road-service-fill", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#F8F7F5"),  // slightly warmer white for service roads
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 0.3f), Expression.stop(14, 1.2f), Expression.stop(16, 2.5f))),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["service","living_street"]]]""")))
                 // Road name labels — only on features that have a name property
-                // Use "has" filter to avoid crash on unnamed roads
+                // Road name labels — crisp, Apple Maps style with strong halos
                 style.addLayer(SymbolLayer("l-label-road-major", SRC_LINE).withProperties(
                     PropertyFactory.textField(Expression.get("name")),
-                    PropertyFactory.textSize(11.5f),
-                    PropertyFactory.textColor("#4A4A40"),
-                    PropertyFactory.textHaloColor("#FFFDF8"),
-                    PropertyFactory.textHaloWidth(2.5f),
+                    PropertyFactory.textTransform(Property.TEXT_TRANSFORM_UPPERCASE),
+                    PropertyFactory.textSize(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(12, 9f), Expression.stop(14, 11f), Expression.stop(16, 13f))),
+                    PropertyFactory.textColor("#3A3830"),
+                    PropertyFactory.textHaloColor("#FFFEF9"),
+                    PropertyFactory.textHaloWidth(3.0f),
+                    PropertyFactory.textHaloBlur(0.5f),
                     PropertyFactory.symbolPlacement("line"),
-                    PropertyFactory.symbolSpacing(300.0f),
-                    PropertyFactory.textMaxAngle(30.0f),
+                    PropertyFactory.symbolSpacing(280.0f),
+                    PropertyFactory.textMaxAngle(25.0f),
                     PropertyFactory.textOptional(true),
                     PropertyFactory.textAllowOverlap(false),
-                    PropertyFactory.textFont(arrayOf("Open Sans Bold", "Arial Unicode MS Regular")),
+                    PropertyFactory.textLetterSpacing(0.08f),
+                    PropertyFactory.textFont(arrayOf("Open Sans SemiBold", "Open Sans Bold", "Arial Unicode MS Regular")),
                 ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["primary","secondary","trunk","motorway"]]]]""")))
                 style.addLayer(SymbolLayer("l-label-road-minor", SRC_LINE).withProperties(
                     PropertyFactory.textField(Expression.get("name")),
-                    PropertyFactory.textSize(9.5f),
-                    PropertyFactory.textColor("#686460"),
-                    PropertyFactory.textHaloColor("#FFFDF8"),
-                    PropertyFactory.textHaloWidth(2.0f),
+                    PropertyFactory.textTransform(Property.TEXT_TRANSFORM_UPPERCASE),
+                    PropertyFactory.textSize(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 8f), Expression.stop(14, 9.5f), Expression.stop(16, 11f))),
+                    PropertyFactory.textColor("#555048"),
+                    PropertyFactory.textHaloColor("#FFFEF9"),
+                    PropertyFactory.textHaloWidth(2.5f),
+                    PropertyFactory.textHaloBlur(0.5f),
                     PropertyFactory.symbolPlacement("line"),
-                    PropertyFactory.symbolSpacing(400.0f),
-                    PropertyFactory.textMaxAngle(30.0f),
+                    PropertyFactory.symbolSpacing(200.0f),
+                    PropertyFactory.textMaxAngle(25.0f),
                     PropertyFactory.textOptional(true),
                     PropertyFactory.textAllowOverlap(false),
                     PropertyFactory.textFont(arrayOf("Open Sans Regular", "Arial Unicode MS Regular")),
-                ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["tertiary","residential","unclassified"]]]]""")))
-                // Neighborhood / district name labels
+                ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["tertiary","residential","unclassified","living_street"]]]]""")))
+                // Neighborhood / district labels
                 style.addLayer(SymbolLayer("l-label-places", SRC_PLACES).withProperties(
                     PropertyFactory.textField(Expression.get("name")),
                     PropertyFactory.textSize(Expression.match(
                         Expression.get("type"),
-                        Expression.literal(12.0f),
-                        Expression.stop("suburb", 13.5f),
-                        Expression.stop("neighbourhood", 11.0f),
-                        Expression.stop("water", 13.0f)
+                        Expression.literal(11.5f),
+                        Expression.stop("suburb", 14.0f),
+                        Expression.stop("neighbourhood", 11.5f),
+                        Expression.stop("water", 12.0f)
                     )),
                     PropertyFactory.textColor(Expression.match(
                         Expression.get("type"),
-                        Expression.literal("#666660"),
-                        Expression.stop("water", "#3B7EA6"),
-                        Expression.stop("suburb", "#333330")
+                        Expression.literal("#555050"),
+                        Expression.stop("water", "#2E6E96"),
+                        Expression.stop("suburb", "#2C2C28")
                     )),
                     PropertyFactory.textHaloColor("#FFFEFB"),
-                    PropertyFactory.textHaloWidth(2.0f),
-                    PropertyFactory.textLetterSpacing(0.08f),
+                    PropertyFactory.textHaloWidth(2.5f),
+                    PropertyFactory.textHaloBlur(0.5f),
+                    PropertyFactory.textLetterSpacing(0.10f),
                     PropertyFactory.textTransform(Property.TEXT_TRANSFORM_UPPERCASE),
                     PropertyFactory.textFont(arrayOf("Open Sans Regular", "Arial Unicode MS Regular")),
                     PropertyFactory.textAllowOverlap(false),
@@ -228,11 +424,287 @@ class NativeMapView(private val context: Context) {
                     PropertyFactory.iconAllowOverlap(false),
                 ))
 
-                // POI points — disabled until proper icon/label data is available
-                // style.addLayer(CircleLayer("l-point", SRC_POINT)...)
+                // POI — Apple Maps teardrop pins (circle + downward point) with white unicode glyphs
+                if (areaLabelsGeoJson != null) {
+                    // Water labels — italic blue (Apple Maps shows river names in light blue-gray)
+                    style.addLayer(SymbolLayer("l-label-water", SRC_AREA_LABELS).withProperties(
+                        PropertyFactory.textField(Expression.get("name")),
+                        PropertyFactory.textFont(arrayOf("Open Sans Regular,Arial Unicode MS Regular")),
+                        PropertyFactory.textSize(11f),
+                        PropertyFactory.textColor("#5591B8"),         // Apple Maps water label — muted steel blue
+                        PropertyFactory.textHaloColor("#B5D8EA"),      // Match water fill for tight halo
+                        PropertyFactory.textHaloWidth(1.2f),
+                        PropertyFactory.textLetterSpacing(0.08f),
+                        PropertyFactory.textAllowOverlap(false),
+                        PropertyFactory.textOptional(true),
+                        PropertyFactory.symbolSpacing(300f),
+                        PropertyFactory.textMaxWidth(8f),
+                    ).withFilter(
+                        Expression.raw("""["==",["get","label_type"],"water"]""")
+                    ))
+                    // Park labels — italic dark green (Apple Maps style)
+                    style.addLayer(SymbolLayer("l-label-park", SRC_AREA_LABELS).withProperties(
+                        PropertyFactory.textField(Expression.get("name")),
+                        PropertyFactory.textFont(arrayOf("Open Sans Regular,Arial Unicode MS Regular")),
+                        PropertyFactory.textSize(10f),
+                        PropertyFactory.textColor("#3D7A44"),          // Apple Maps park label — medium dark green
+                        PropertyFactory.textHaloColor("#C4D9A8"),      // Match park fill
+                        PropertyFactory.textHaloWidth(1.5f),
+                        PropertyFactory.textAllowOverlap(false),
+                        PropertyFactory.textOptional(true),
+                        PropertyFactory.symbolSpacing(300f),
+                        PropertyFactory.textMaxWidth(8f),
+                    ).withFilter(
+                        Expression.raw("""["==",["get","label_type"],"park"]""")
+                    ))
+                }
+
+                // POI — Apple Maps teardrop pins (circle + downward point) with white unicode glyphs
+                if (poisGeoJson != null) {
+                    val landmarkFilter = Expression.raw("""["==",["get","rank"],1000]""")
+                    val foodFilter = Expression.raw("""["all",["!=",["get","rank"],1000],["in",["get","cat"],["literal",["restaurant","cafe","bar"]]]]""")
+
+                    data class IconDef(
+                        val imgName: String,
+                        val bgColor: Int,
+                        val glyph: String,
+                        val labelColor: String,
+                    )
+
+                    // Draw Apple Maps-style circular pin with vector-drawn icon (no unicode glyph)
+                    // icon = "museum"|"food"|"hotel"|"viewpoint"|"attraction"|"theatre"
+                    fun makePin(colorArgb: Int, icon: String): android.graphics.Bitmap {
+                        val SZ = 128  // 128px = icons stay crisp at 0.28× MapLibre scale
+                        val bmp = android.graphics.Bitmap.createBitmap(SZ, SZ, android.graphics.Bitmap.Config.ARGB_8888)
+                        val cv = android.graphics.Canvas(bmp)
+                        val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                        val cx = SZ / 2f; val cy = SZ / 2f; val r = SZ / 2f - 3f
+
+                        // Drop shadow
+                        p.color = 0x33000000.toInt(); p.style = android.graphics.Paint.Style.FILL
+                        cv.drawCircle(cx + 3f, cy + 4f, r, p)
+
+                        // Circle body
+                        p.color = colorArgb
+                        cv.drawCircle(cx, cy, r, p)
+
+                        // White ring
+                        p.color = 0xFFFFFFFF.toInt(); p.style = android.graphics.Paint.Style.STROKE; p.strokeWidth = 4.5f
+                        cv.drawCircle(cx, cy, r, p)
+
+                        // White icon drawn as vector paths — scaled for 128px bitmap (cx=64, cy=64, icon ±25px)
+                        // These are direct Canvas draw calls on the 128px bitmap
+                        p.color = 0xFFFFFFFF.toInt(); p.style = android.graphics.Paint.Style.FILL
+                        p.strokeJoin = android.graphics.Paint.Join.ROUND; p.strokeCap = android.graphics.Paint.Cap.ROUND
+
+                        when (icon) {
+                            "food" -> {
+                                // Fork (left) + knife (right) — Apple Maps restaurant icon
+                                p.style = android.graphics.Paint.Style.STROKE; p.strokeWidth = 6f
+                                // Fork: vertical handle left
+                                cv.drawLine(cx - 14f, cy - 25f, cx - 14f, cy + 25f, p)
+                                // Tines
+                                cv.drawLine(cx - 21f, cy - 25f, cx - 21f, cy - 7f, p)
+                                cv.drawLine(cx - 7f,  cy - 25f, cx - 7f,  cy - 7f, p)
+                                // Cross-bar
+                                cv.drawLine(cx - 21f, cy - 7f, cx - 7f, cy - 7f, p)
+                                // Knife: blade + handle right
+                                cv.drawLine(cx + 14f, cy - 25f, cx + 14f, cy + 25f, p)
+                                val kPath = android.graphics.Path()
+                                kPath.moveTo(cx + 9f, cy - 25f); kPath.lineTo(cx + 14f, cy - 25f)
+                                kPath.lineTo(cx + 14f, cy - 4f); kPath.lineTo(cx + 9f,  cy - 4f); kPath.close()
+                                p.style = android.graphics.Paint.Style.FILL; cv.drawPath(kPath, p)
+                            }
+                            "hotel" -> {
+                                p.style = android.graphics.Paint.Style.FILL
+                                // Mattress base
+                                cv.drawRoundRect(android.graphics.RectF(cx-27f, cy-4f, cx+27f, cy+23f), 7f, 7f, p)
+                                // Headboard
+                                cv.drawRoundRect(android.graphics.RectF(cx-27f, cy-23f, cx-14f, cy+4f), 5f, 5f, p)
+                                // Pillow
+                                cv.drawRoundRect(android.graphics.RectF(cx-11f, cy-16f, cx+25f, cy-2f), 9f, 9f, p)
+                            }
+                            "museum" -> {
+                                p.style = android.graphics.Paint.Style.FILL
+                                // Base
+                                cv.drawRect(cx-25f, cy+14f, cx+25f, cy+25f, p)
+                                // Step
+                                cv.drawRect(cx-21f, cy+7f, cx+21f, cy+16f, p)
+                                // 3 columns
+                                for (col in -1..1) {
+                                    cv.drawRect(cx+col*14f-3.5f, cy-14f, cx+col*14f+3.5f, cy+9f, p)
+                                }
+                                // Pediment
+                                val tri = android.graphics.Path()
+                                tri.moveTo(cx-25f, cy-14f); tri.lineTo(cx, cy-32f); tri.lineTo(cx+25f, cy-14f); tri.close()
+                                cv.drawPath(tri, p)
+                            }
+                            "viewpoint" -> {
+                                p.style = android.graphics.Paint.Style.STROKE; p.strokeWidth = 7f
+                                cv.drawCircle(cx-12f, cy+4f, 14f, p)
+                                cv.drawCircle(cx+12f, cy+4f, 14f, p)
+                                p.style = android.graphics.Paint.Style.FILL
+                                cv.drawRect(cx-5f, cy-7f, cx+5f, cy+2f, p)
+                                p.style = android.graphics.Paint.Style.STROKE; p.strokeWidth = 7f
+                                cv.drawLine(cx-12f, cy-10f, cx-16f, cy-23f, p)
+                                cv.drawLine(cx+12f, cy-10f, cx+16f, cy-23f, p)
+                            }
+                            "attraction" -> {
+                                p.style = android.graphics.Paint.Style.FILL
+                                val starPath = android.graphics.Path()
+                                val outerR = 25f; val innerR = 11f
+                                for (i in 0 until 10) {
+                                    val angle = (Math.PI * i / 5 - Math.PI / 2).toFloat()
+                                    val rr2 = if (i % 2 == 0) outerR else innerR
+                                    val x = cx + rr2 * Math.cos(angle.toDouble()).toFloat()
+                                    val y = cy + rr2 * Math.sin(angle.toDouble()).toFloat()
+                                    if (i == 0) starPath.moveTo(x, y) else starPath.lineTo(x, y)
+                                }
+                                starPath.close(); cv.drawPath(starPath, p)
+                            }
+                            "theatre" -> {
+                                p.style = android.graphics.Paint.Style.STROKE; p.strokeWidth = 5f
+                                cv.drawCircle(cx+9f, cy-5f, 18f, p)
+                                val smilePath = android.graphics.Path(); smilePath.addArc(
+                                    android.graphics.RectF(cx, cy-14f, cx+18f, cy+4f), 0f, 180f)
+                                cv.drawPath(smilePath, p)
+                                cv.drawCircle(cx-11f, cy+5f, 14f, p)
+                                val frown = android.graphics.Path(); frown.addArc(
+                                    android.graphics.RectF(cx-20f, cy+4f, cx-2f, cy+22f), 0f, -180f)
+                                cv.drawPath(frown, p)
+                            }
+                            else -> {
+                                val tp = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                                tp.color = 0xFFFFFFFF.toInt(); tp.textSize = r * 0.92f
+                                tp.isFakeBoldText = true; tp.textAlign = android.graphics.Paint.Align.CENTER
+                                tp.typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                cv.drawText(icon.first().uppercaseChar().toString(), cx, cy + tp.textSize * 0.37f, tp)
+                            }
+                        }
+                        return bmp
+                    }
+                    // Alias for compatibility with call site
+                    fun makeTeardropPin(colorArgb: Int, glyph: String) = makePin(colorArgb, glyph)
+
+                    val iconDefs = listOf(
+                        // label colors — Apple Maps uses dark labels for all categories
+                        IconDef("poi-museum",     0xFF9166DB.toInt(), "museum",     "#1C1C1E"),  // dark (Apple SF-style)
+                        IconDef("poi-attraction", 0xFFDC3048.toInt(), "attraction", "#1C1C1E"),
+                        IconDef("poi-theatre",    0xFF7C3AED.toInt(), "theatre",    "#1C1C1E"),
+                        IconDef("poi-viewpoint",  0xFF16A34A.toInt(), "viewpoint",  "#1C1C1E"),
+                        IconDef("poi-hotel",      0xFF3B6FD4.toInt(), "hotel",      "#1C1C1E"),
+                        IconDef("poi-food",       0xFFEA580C.toInt(), "food",       "#1C1C1E"),
+                    )
+
+                    for (def in iconDefs) {
+                        // Load pre-rendered pin PNG from assets (guaranteed pixel-perfect)
+                        val bmp = try {
+                            val stream = context.assets.open("${def.imgName}.png")
+                            android.graphics.BitmapFactory.decodeStream(stream).also { stream.close() }
+                        } catch (e: Exception) {
+                            makeTeardropPin(def.bgColor, def.glyph)  // fallback to canvas
+                        }
+                        style.addImage(def.imgName, bmp)
+                    }
+
+                    val catFilterStr = mapOf(
+                        "poi-museum"     to """["in",["get","cat"],["literal",["museum","gallery"]]]""",
+                        "poi-attraction" to """["in",["get","cat"],["literal",["attraction","castle"]]]""",
+                        "poi-theatre"    to """["in",["get","cat"],["literal",["theatre","cinema"]]]""",
+                        "poi-viewpoint"  to """["==",["get","cat"],"viewpoint"]""",
+                        "poi-hotel"      to """["==",["get","cat"],"hotel"]""",
+                        "poi-food"       to """["in",["get","cat"],["literal",["restaurant","cafe","bar","food","pub","fast_food","bistro"]]]""",
+                    )
+
+                    for (def in iconDefs) {
+                        val isFood = def.imgName == "poi-food"
+                        val catStr = catFilterStr[def.imgName] ?: """["==","cat","${def.imgName}"]"""
+                        // Simple static rank filter — no zoom expressions in filter (MapLibre Android doesn't support them)
+                        // rank=1000 landmarks handled by the landmark layer above; regular layer shows rank 600-999
+                        // Food uses its own minZoom gate (15.0) with no rank filter
+                        val regularFilter = if (isFood)
+                            Expression.raw("""["all",["!=",["get","rank"],1000],$catStr]""")
+                        else
+                            Expression.raw("""["all",["!=",["get","rank"],1000],[">=",["get","rank"],600],$catStr]""")
+                        style.addLayer(SymbolLayer("l-${def.imgName}", SRC_POI).withProperties(
+                            PropertyFactory.iconImage(def.imgName),
+                            PropertyFactory.iconAnchor("center"),   // circle pins: center-anchored
+                            PropertyFactory.iconSize(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                                Expression.stop(12, if (isFood) 0.28f else 0.32f),
+                                Expression.stop(14, if (isFood) 0.38f else 0.44f),
+                                Expression.stop(16, if (isFood) 0.48f else 0.56f))),
+                            PropertyFactory.iconAllowOverlap(false),
+                            PropertyFactory.iconIgnorePlacement(false),
+                            PropertyFactory.textField(if (isFood) Expression.literal("") else Expression.get("name")),
+                            PropertyFactory.textSize(9.5f),
+                            PropertyFactory.textColor(def.labelColor),
+                            PropertyFactory.textHaloColor("#FFFEF5"),
+                            PropertyFactory.textHaloWidth(1.8f),
+                            PropertyFactory.textHaloBlur(0.2f),
+                            PropertyFactory.textAnchor("top"),
+                            PropertyFactory.textOffset(arrayOf(0f, 0.6f)),  // offset from center, not bottom
+                            PropertyFactory.textOptional(true),
+                            PropertyFactory.textAllowOverlap(false),
+                            PropertyFactory.textMaxWidth(8.0f),
+                            PropertyFactory.symbolSpacing(if (isFood) 400f else 80f),
+                            PropertyFactory.textFont(arrayOf("Open Sans Bold", "Arial Unicode MS Regular")),
+                        ).withFilter(regularFilter))
+                        if (isFood) style.getLayer("l-${def.imgName}")?.minZoom = 16f
+                    }
+
+                    // Bridge name labels — text only, no pin (Apple Maps style: small-caps gray label)
+                    style.addLayer(SymbolLayer("l-poi-bridges", SRC_POI).withProperties(
+                        PropertyFactory.textField(Expression.get("name")),
+                        PropertyFactory.textSize(10.0f),
+                        PropertyFactory.textColor("#555555"),
+                        PropertyFactory.textHaloColor("#FFFFF8"),
+                        PropertyFactory.textHaloWidth(1.5f),
+                        PropertyFactory.textHaloBlur(0.3f),
+                        PropertyFactory.textFont(arrayOf("Open Sans Bold", "Arial Unicode MS Regular")),
+                        PropertyFactory.textAnchor("center"),
+                        PropertyFactory.textAllowOverlap(false),
+                        PropertyFactory.textIgnorePlacement(false),
+                        PropertyFactory.textMaxWidth(8.0f),
+                        PropertyFactory.textLetterSpacing(0.06f),
+                        PropertyFactory.textTransform(Property.TEXT_TRANSFORM_UPPERCASE),
+                    ).withFilter(Expression.raw("""["==",["get","cat"],"bridge"]""")))
+                    // Landmarks — always visible
+                    style.addLayer(SymbolLayer("l-poi-landmarks", SRC_POI).withProperties(
+                        PropertyFactory.iconImage(
+                            Expression.match(Expression.get("cat"), Expression.literal("poi-attraction"),
+                                Expression.stop("museum",     "poi-museum"),
+                                Expression.stop("gallery",    "poi-museum"),
+                                Expression.stop("attraction", "poi-attraction"),
+                                Expression.stop("castle",     "poi-attraction"),
+                                Expression.stop("viewpoint",  "poi-viewpoint"),
+                                Expression.stop("theatre",    "poi-theatre"),
+                                Expression.stop("cinema",     "poi-theatre"),
+                                Expression.stop("hotel",      "poi-hotel"),
+                            )
+                        ),
+                        PropertyFactory.iconAnchor("center"),   // circle pins: center-anchored
+                        PropertyFactory.iconSize(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                            Expression.stop(12, 0.36f), Expression.stop(14, 0.50f), Expression.stop(16, 0.64f))),
+                        PropertyFactory.iconAllowOverlap(true),
+                        PropertyFactory.iconIgnorePlacement(true),
+                        PropertyFactory.textField(Expression.get("name")),
+                        PropertyFactory.textSize(10.5f),
+                        PropertyFactory.textColor("#1C1C1E"),   // Apple Maps: landmark labels — near-black (SF style)
+                        PropertyFactory.textHaloColor("#FFFFF8"),
+                        PropertyFactory.textHaloWidth(2.0f),
+                        PropertyFactory.textHaloBlur(0.2f),
+                        PropertyFactory.textAnchor("top"),
+                        PropertyFactory.textOffset(arrayOf(0f, 0.6f)),
+                        PropertyFactory.textAllowOverlap(false),
+                        PropertyFactory.textIgnorePlacement(false),
+                        PropertyFactory.textOptional(false),
+                        PropertyFactory.textMaxWidth(9.0f),
+                        PropertyFactory.textFont(arrayOf("Open Sans Bold", "Arial Unicode MS Regular")),
+                    ).withFilter(landmarkFilter))
+                }
 
                 mlMap.cameraPosition = CameraPosition.Builder()
-                    .target(LatLng(50.0868, 14.4115)).zoom(14.0).build()
+                    .target(LatLng(initLat, initLon)).zoom(initZoom).build()
 
                 mlMap.addOnCameraIdleListener { loadVisibleTiles() }
                 loadVisibleTiles()
@@ -275,22 +747,31 @@ class NativeMapView(private val context: Context) {
         Log.d(TAG, "Loading $tileCount tiles z=$zoom x=$xMin..$xMax y=$yMin..$yMax | bounds lon=[${bounds.longitudeWest.round(4)},${bounds.longitudeEast.round(4)}] lat=[${bounds.latitudeSouth.round(4)},${bounds.latitudeNorth.round(4)}]")
 
         scope.launch {
-            // Fetch style 1 (polygons), style 20 (roads), and style 99 (classification raster)
-            data class TileResult(val x: Int, val y: Int, val parsed: ParsedTile)
+            // Fetch style 1 (polygons), style 20 (roads)
+            data class TileResult(val x: Int, val y: Int, val tile: VectorTile)
             val results = mutableListOf<TileResult>()
             val jobs = mutableListOf<Deferred<TileResult?>>()
             val style99Jobs = mutableListOf<Deferred<Pair<String, IntArray?>>>()
 
-            // Style 1 = base polygons (OSM roads fetched separately)
+            // Style 1 = base polygons/roads. Apple VMP4 polygon/road data is at z=14.
+            // At z≥14: request z=14 parent tiles for VMP4 decode; OSM roads layer handles z=15 detail.
             val styles = listOf(1)
+            val vmpZ = 14  // VMP4 polygon data is published at z=14
+
+            // Compute z=14 tile range from visible bounds
+            val n14 = (1 shl vmpZ).toDouble()
+            val vmpXMin = (((bounds.longitudeWest + 180) / 360 * n14).toInt() - 1).coerceAtLeast(0)
+            val vmpXMax = (((bounds.longitudeEast + 180) / 360 * n14).toInt() + 1).coerceAtMost(n14.toInt() - 1)
+            val vmpYMin = (latToTileY(bounds.latitudeNorth, vmpZ) - 1).coerceAtLeast(0)
+            val vmpYMax = (latToTileY(bounds.latitudeSouth, vmpZ) + 1).coerceAtMost(n14.toInt() - 1)
 
             // Kick off OSM road fetch for the entire visible area (one request covers all tiles)
             val osmJob: Deferred<String?> = async { fetchOsmRoads(xMin, xMax, yMin, yMax, zoom) }
 
-            for (x in xMin..xMax) for (y in yMin..yMax) {
+            for (x in vmpXMin..vmpXMax) for (y in vmpYMin..vmpYMax) {
                 val tx = x; val ty = y
                 for (style in styles) {
-                    jobs.add(async { fetchAndParse(zoom, tx, ty, style = style)?.let { TileResult(tx, ty, it) } })
+                    jobs.add(async { fetchAndParseVmp4(vmpZ, tx, ty, style = style)?.let { TileResult(tx, ty, it) } })
                 }
                 // Style 99 = per-pixel style class raster (water=1, park=2, land=0)
                 // Style 99 is ONLY available at z=14 (confirmed from ActiveTileGroup.pbd).
@@ -319,53 +800,30 @@ class NativeMapView(private val context: Context) {
             var pf = true; var lf = true; var ptf = true
 
             for (tile in results) {
-                val (tx, ty, parsed) = tile
-                // Polygons — sample style 99 raster at centroid for ft classification.
-                // Style 99: value 0=land, 1=water, 2=park → mapped to ft 0/94/64.
-                parsed.polygonVertices?.let { pool ->
-                    val s99z14 = 14
-                    val s99x14 = if (zoom <= 14) tx shr (14 - zoom) else tx shl (zoom - 14)
-                    val s99y14 = if (zoom <= 14) ty shr (14 - zoom) else ty shl (zoom - 14)
-                    val ftMap = synchronized(style99Cache) { style99Cache["$s99z14/$s99x14/$s99y14"] }
-                    for (i in pool.shapeStarts.indices) {
-                        val start = pool.shapeStarts[i]
-                        val len = pool.shapeLengths[i]
-                        if (len < 3 || start + len > pool.vertices.size) continue
-                        // Sample style 99 at shape centroid for feature type classification
-                        val ft = if (ftMap != null) {
-                            val cx = pool.vertices.subList(start, start + len).sumOf { it.x.toDouble() }.toFloat() / len
-                            val cy = pool.vertices.subList(start, start + len).sumOf { it.y.toDouble() }.toFloat() / len
-                            Style99Decoder.sampleFt(ftMap, cx, cy)
-                        } else 0
-                        if (!pf) polySb.append(','); pf = false
-                        polySb.append("""{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[""")
-                        for (j in 0 until len) {
-                            if (j > 0) polySb.append(',')
-                            appendCoord(polySb, pool.vertices[start + j], tx, ty, zoom)
-                        }
-                        polySb.append(','); appendCoord(polySb, pool.vertices[start], tx, ty, zoom)
-                        polySb.append("""]]},""")
-                        polySb.append(""""properties":{"ft":$ft}}""")
-                    }
+                val (tx, ty, vtile) = tile
+                // Use new Vmp4Decoder — real Apple format with validated vertex codec
+                val (tilePolyJson, tileLineJson) = vtile.toGeoJson()
+                Log.d(TAG, "Tile toGeoJson: poly=${tilePolyJson.length} line=${tileLineJson.length}")
+                // Merge into overall FeatureCollections
+                // Strip outer wrapper and extract features array content
+                val polyFeats = tilePolyJson.removePrefix("""{"type":"FeatureCollection","features":[""").removeSuffix("]}")
+                val lineFeats = tileLineJson.removePrefix("""{"type":"FeatureCollection","features":[""").removeSuffix("]}")
+                if (polyFeats.isNotEmpty()) {
+                    if (!pf) polySb.append(','); pf = false
+                    polySb.append(polyFeats)
                 }
-                // Roads are now from OSM — lineSb will be populated below after OSM fetch
-                // Points
-                parsed.pointVertices?.let { pool ->
-                    for (v in pool.vertices) {
-                        if (!ptf) pointSb.append(','); ptf = false
-                        pointSb.append("""{"type":"Feature","geometry":{"type":"Point","coordinates":""")
-                        appendCoord(pointSb, v, tx, ty, zoom)
-                        pointSb.append("""},"properties":{}}""")
-                    }
+                if (lineFeats.isNotEmpty()) {
+                    if (!lf) lineSb.append(','); lf = false
+                    lineSb.append(lineFeats)
                 }
             }
-
-            polySb.append("]}"); pointSb.append("]}")
-            // lineSb populated by OSM roads
+            polySb.append("]}"); lineSb.append("]}"); pointSb.append("]}")
+            // Merge VMP4 road lines with OSM roads (OSM takes priority for labeled roads)
             val osmRoadsJson = osmJob.await()
             val polyJson = polySb.toString()
             val emptyGeoJson = """{"type":"FeatureCollection","features":[]}"""
-            val lineJson = osmRoadsJson ?: emptyGeoJson
+            // Prefer OSM roads (richer classification) but fall back to VMP4 road lines
+            val lineJson = osmRoadsJson ?: if (lineSb.length > 50) lineSb.toString() else emptyGeoJson
             val pointJson = pointSb.toString()
 
             withContext(Dispatchers.Main) {
@@ -393,27 +851,31 @@ class NativeMapView(private val context: Context) {
                     val allLoaded = tileGrid.all { row -> row.all { it != null } }
                     val compositeKey = "composite-$zoom-$xMin-$xMax-$yMin-$yMax"
                     if (allLoaded && compositeKey !in style99Added) {
-                        val totalW = cols * tileSize
-                        val totalH = rows * tileSize
-                        val composite = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
-                        val canvas = android.graphics.Canvas(composite)
-                        val paint = android.graphics.Paint().apply {
-                            isFilterBitmap = true; isAntiAlias = true
-                        }
+                        // Build composite at 1× (512px tiles) with software Gaussian blur for edge AA.
+                        // 2× supersampling OOMed on device (4×4 grid @ 2× = 67MB just for pixel arrays).
+                        // 1× blur with radius=2 uses only ~6MB for a 5×5 grid — safe.
+                        // MapLibre rasterResampling=LINEAR handles sub-pixel smoothness during map rendering.
+                        val finalW = cols * tileSize; val finalH = rows * tileSize
+                        val compositePixels = IntArray(finalW * finalH)
 
                         for (row in 0 until rows) for (col in 0 until cols) {
                             val ftMap = tileGrid[row][col] ?: continue
-                            val colors = IntArray(tileSize * tileSize) { i ->
-                                when (ftMap[i]) {
-                                    94 -> 0xFF8EC8E8.toInt()   // water blue
-                                    64 -> 0xFFD4E8C2.toInt()   // park green
+                            for (py in 0 until tileSize) for (px in 0 until tileSize) {
+                                val ft = ftMap[py * tileSize + px]
+                                val color = when (ft) {
+                                    94 -> 0xFF8FD3E8.toInt()   // water  #8FD3E8
+                                    64 -> 0xFFB9D89B.toInt()   // park   #B9D89B
                                     else -> 0x00000000          // transparent
                                 }
+                                compositePixels[(row * tileSize + py) * finalW + (col * tileSize + px)] = color
                             }
-                            val tileBmp = Bitmap.createBitmap(colors, tileSize, tileSize, Bitmap.Config.ARGB_8888)
-                            canvas.drawBitmap(tileBmp, (col * tileSize).toFloat(), (row * tileSize).toFloat(), paint)
-                            tileBmp.recycle()
                         }
+
+                        // No software blur — MapLibre LINEAR resampling handles edge smoothing.
+                        // Software blur was causing color bleed at water/park boundaries.
+                        // The style99 raster placed above l-land provides clean water/park coloring.
+                        val composite = Bitmap.createBitmap(finalW, finalH, Bitmap.Config.ARGB_8888)
+                        composite.setPixels(compositePixels, 0, finalW, 0, 0, finalW, finalH)
 
                         // Remove any old composite source/layer
                         style99Added.filter { it.startsWith("composite-") }.forEach { old ->
@@ -432,13 +894,12 @@ class NativeMapView(private val context: Context) {
                                 LatLng(latMax, lonMin), LatLng(latMax, lonMax),
                                 LatLng(latMin, lonMax), LatLng(latMin, lonMin)
                             ), composite))
-                            s.addLayerBelow(RasterLayer("l-s99-$compositeKey", "s99-$compositeKey").withProperties(
-                                PropertyFactory.rasterOpacity(1.0f),
-                                PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_LINEAR)
-                            ), "l-land")
-                            style99Added.add(compositeKey)
+                            // DISABLED: OSM vector water+parks now cover all features.
+                            // Style99 caused blue noise slivers (fountains/small water) in Josefov.
+                            // Keep the bitmap built for potential future use, but don't add the layer.
+                            // s.addLayerAbove(RasterLayer(...), "l-land")
                             composite.recycle()
-                            Log.d(TAG, "Added composite style99 raster ${cols}x${rows} tiles")
+                            Log.d(TAG, "Style99 composite built but NOT added (OSM vector takes over)")
                         } catch (e: Exception) {
                             Log.w(TAG, "Failed to add composite raster: ${e.message}")
                             composite.recycle()
@@ -449,9 +910,39 @@ class NativeMapView(private val context: Context) {
         }
     }
 
-    private suspend fun fetchAndParse(z: Int, x: Int, y: Int, style: Int = 1): ParsedTile? {
-        val key = "$z/$x/$y/s$style"
+    /** Fetch + decode a VMP4 tile using the validated real-format decoder */
+    private suspend fun fetchAndParseVmp4(z: Int, x: Int, y: Int, style: Int = 1): VectorTile? {
+        val key = "$z/$x/$y/s${style}_v2"
         synchronized(tileCache) { tileCache[key] }?.let { return it }
+        return try {
+            val assetName = "tile_${z}_${x}_${y}_s${style}.bin"
+            val bytes: ByteArray = try {
+                context.assets.open(assetName).readBytes().also {
+                    Log.d(TAG, "Tile $key: loaded from asset $assetName (${it.size}b)")
+                }
+            } catch (_: Exception) {
+                val url = NativeAuth.vectorTileUrl(z, x, y, style = style)
+                client.get(url).bodyAsBytes()
+            }
+            if (bytes.size < 8 || bytes[0] != 'V'.code.toByte()) {
+                Log.w(TAG, "Tile $key: not VMP4, ${bytes.size}b")
+                null
+            } else {
+                val tile = decodeVmp4Tile(bytes, z, x, y)
+                val polyCount = tile.polygonFeatures.values.sumOf { it.size }
+                val lineCount = tile.lineFeatures.size
+                Log.d(TAG, "Tile $key: polys=$polyCount lines=$lineCount")
+                synchronized(tileCache) { tileCache[key] = tile }
+                tile
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Tile $key failed: ${e.message}")
+            null
+        }
+    }
+
+    private suspend fun fetchAndParse(z: Int, x: Int, y: Int, style: Int = 1): ParsedTile? {
+        val key = "$z/$x/$y/s$style/old"
         return try {
             // Try asset fallback first (for offline testing)
             val assetName = "tile_${z}_${x}_${y}_s${style}.bin"
@@ -470,8 +961,7 @@ class NativeMapView(private val context: Context) {
                 val parsed = parseTile(bytes)
                 val polyTypes = parsed.polygons.take(20).map { it.featureType }
                 val lineTypes = parsed.lines.take(10).map { it.featureType }
-                Log.d(TAG, "Tile $key: polyShapes=${parsed.polygonVertices?.shapeStarts?.size ?: 0} polyTypes=$polyTypes lineShapes=${parsed.lineVertices?.shapeStarts?.size ?: 0} lineTypes=$lineTypes")
-                synchronized(tileCache) { tileCache[key] = parsed }
+                Log.d(TAG, "Tile $key: polys=${parsed.polygons.size} polyTypes=$polyTypes lines=${parsed.lines.size} lineTypes=$lineTypes")
                 parsed
             }
         } catch (e: Exception) {
@@ -728,8 +1218,126 @@ class NativeMapView(private val context: Context) {
         val r = Math.toRadians(lat)
         return floor((1.0 - ln(Math.tan(r) + 1.0 / Math.cos(r)) / Math.PI) / 2.0 * n).toInt()
     }
+
+    /**
+     * Software separable box blur on a raw ARGB IntArray (2 passes: horizontal + vertical).
+     * Uses sliding-window sums: O(W×H) — not O(W×H×kernel) — regardless of radius.
+     * Used for anti-aliasing water/park edges in the style99 composite.
+     * radius=2 gives a ~2px soft edge — enough to remove the hard pixel-grid appearance.
+     * Memory: 3 IntArrays of finalW × finalH × 4 bytes (~6MB for a 5×5 tile grid).
+     */
+    private fun boxBlur2D(src: IntArray, w: Int, h: Int, radius: Int): IntArray {
+        val r = radius.coerceAtLeast(1)
+        val tmp = IntArray(w * h)
+
+        // Horizontal pass using sliding window: O(W×H) total
+        for (y in 0 until h) {
+            var aSum = 0; var rSum = 0; var gSum = 0; var bSum = 0
+            // Seed window [-r, 0)
+            for (dx in -r until 0) {
+                val p = src[y * w + 0]  // clamp left
+                aSum += (p ushr 24) and 0xFF; rSum += (p shr 16) and 0xFF
+                gSum += (p shr 8) and 0xFF; bSum += p and 0xFF
+            }
+            // Seed window [0, r]
+            for (dx in 0..r) {
+                val p = src[y * w + dx.coerceAtMost(w - 1)]
+                aSum += (p ushr 24) and 0xFF; rSum += (p shr 16) and 0xFF
+                gSum += (p shr 8) and 0xFF; bSum += p and 0xFF
+            }
+            val cnt = r * 2 + 1
+            for (x in 0 until w) {
+                tmp[y * w + x] = ((aSum / cnt) shl 24) or ((rSum / cnt) shl 16) or
+                                  ((gSum / cnt) shl 8) or (bSum / cnt)
+                // Slide: remove leftmost, add next right
+                val remove = src[y * w + (x - r).coerceAtLeast(0)]
+                val add    = src[y * w + (x + r + 1).coerceAtMost(w - 1)]
+                aSum += ((add ushr 24) and 0xFF) - ((remove ushr 24) and 0xFF)
+                rSum += ((add shr 16) and 0xFF) - ((remove shr 16) and 0xFF)
+                gSum += ((add shr 8) and 0xFF) - ((remove shr 8) and 0xFF)
+                bSum += (add and 0xFF) - (remove and 0xFF)
+            }
+        }
+        // Vertical pass using sliding window
+        val out = IntArray(w * h)
+        for (x in 0 until w) {
+            var aSum = 0; var rSum = 0; var gSum = 0; var bSum = 0
+            for (dy in -r until 0) {
+                val p = tmp[0 * w + x]  // clamp top
+                aSum += (p ushr 24) and 0xFF; rSum += (p shr 16) and 0xFF
+                gSum += (p shr 8) and 0xFF; bSum += p and 0xFF
+            }
+            for (dy in 0..r) {
+                val p = tmp[dy.coerceAtMost(h - 1) * w + x]
+                aSum += (p ushr 24) and 0xFF; rSum += (p shr 16) and 0xFF
+                gSum += (p shr 8) and 0xFF; bSum += p and 0xFF
+            }
+            val cnt = r * 2 + 1
+            for (y in 0 until h) {
+                out[y * w + x] = ((aSum / cnt) shl 24) or ((rSum / cnt) shl 16) or
+                                  ((gSum / cnt) shl 8) or (bSum / cnt)
+                val remove = tmp[(y - r).coerceAtLeast(0) * w + x]
+                val add    = tmp[(y + r + 1).coerceAtMost(h - 1) * w + x]
+                aSum += ((add ushr 24) and 0xFF) - ((remove ushr 24) and 0xFF)
+                rSum += ((add shr 16) and 0xFF) - ((remove shr 16) and 0xFF)
+                gSum += ((add shr 8) and 0xFF) - ((remove shr 8) and 0xFF)
+                bSum += (add and 0xFF) - (remove and 0xFF)
+            }
+        }
+        return out
+    }
+
+    /**
+     * Alpha-edge blur: blurs ONLY the alpha channel using a sliding-window box blur.
+     * RGB values are taken from the nearest fully-opaque pixel to avoid color bleed into land.
+     * This gives clean, soft edges without desaturating or bleeding water/park colors into land.
+     */
+    private fun alphaEdgeBlur(src: IntArray, w: Int, h: Int, radius: Int): IntArray {
+        val r = radius.coerceAtLeast(1)
+        val alphaOnly = IntArray(w * h) { i -> (src[i] ushr 24) and 0xFF }
+
+        // Horizontal blur on alpha
+        val tmpAlpha = IntArray(w * h)
+        for (y in 0 until h) {
+            var sum = 0
+            for (dx in -r until 0) sum += alphaOnly[y * w + 0]
+            for (dx in 0..r) sum += alphaOnly[y * w + dx.coerceAtMost(w - 1)]
+            val cnt = r * 2 + 1
+            for (x in 0 until w) {
+                tmpAlpha[y * w + x] = sum / cnt
+                sum -= alphaOnly[y * w + (x - r).coerceAtLeast(0)]
+                sum += alphaOnly[y * w + (x + r + 1).coerceAtMost(w - 1)]
+            }
+        }
+        // Vertical blur on alpha
+        val outAlpha = IntArray(w * h)
+        for (x in 0 until w) {
+            var sum = 0
+            for (dy in -r until 0) sum += tmpAlpha[0 * w + x]
+            for (dy in 0..r) sum += tmpAlpha[dy.coerceAtMost(h - 1) * w + x]
+            val cnt = r * 2 + 1
+            for (y in 0 until h) {
+                outAlpha[y * w + x] = sum / cnt
+                sum -= tmpAlpha[(y - r).coerceAtLeast(0) * w + x]
+                sum += tmpAlpha[(y + r + 1).coerceAtMost(h - 1) * w + x]
+            }
+        }
+
+        // Rebuild: keep RGB from original (or nearest opaque if transparent), blend alpha only
+        return IntArray(w * h) { i ->
+            val origAlpha = (src[i] ushr 24) and 0xFF
+            val blurAlpha = outAlpha[i]
+            if (origAlpha == 255 || blurAlpha == 0) {
+                // Fully opaque or invisible — just use blurred alpha with original RGB
+                (blurAlpha shl 24) or (src[i] and 0x00FFFFFF)
+            } else {
+                // Edge pixel: use original RGB (from the feature color) with blurred alpha
+                (blurAlpha shl 24) or (src[i] and 0x00FFFFFF)
+            }
+        }
+    }
 }
 
 private val BLANK_STYLE = """
-{"version":8,"name":"Apple Maps","glyphs":"https://tiles.stadiamaps.com/fonts/{fontstack}/{range}.pbf","sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#F2EFE9"}}]}
+{"version":8,"name":"Apple Maps","glyphs":"asset://fonts/{fontstack}/{range}.pbf","sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#F2EFE9"}}]}
 """.trim()
