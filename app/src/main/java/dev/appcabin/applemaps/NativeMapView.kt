@@ -916,7 +916,7 @@ class NativeMapView(private val context: Context,
 
     /** Fetch + decode a VMP4 tile using the validated real-format decoder */
     private suspend fun fetchAndParseVmp4(z: Int, x: Int, y: Int, style: Int = 1): VectorTile? {
-        val key = "$z/$x/$y/s${style}_v4"
+        val key = "$z/$x/$y/s${style}_v5"
         synchronized(tileCache) { tileCache[key] }?.let { return it }
         return try {
             val assetName = "tile_${z}_${x}_${y}_s${style}.bin"
@@ -982,22 +982,30 @@ class NativeMapView(private val context: Context,
      * Uses OpenStreetMap data © OpenStreetMap contributors, ODbL license.
      * Data fetched from https://overpass-api.de/api/interpreter
      */
-    /** Cached OSM GeoJSON (loaded from asset on first call) */
-    private var cachedOsmGeoJson: String? = null
+    /** Cached OSM GeoJSON per tile bbox (keyed by "z/xmin/xmax/ymin/ymax") */
+    private val cachedOsmByBbox = mutableMapOf<String, String>()
     
     private suspend fun fetchOsmRoads(xMin: Int, xMax: Int, yMin: Int, yMax: Int, zoom: Int): String? {
-        // Try bundled asset first (instant, no network needed)
-        if (cachedOsmGeoJson == null) {
-            cachedOsmGeoJson = try {
+        val bboxKey = "$zoom/$xMin/$xMax/$yMin/$yMax"
+        synchronized(cachedOsmByBbox) { cachedOsmByBbox[bboxKey] }?.let { return it }
+
+        // Check if viewport is over Prague — use bundled asset for instant load
+        val n = (1 shl zoom).toDouble()
+        val lonCenter = ((xMin + xMax) / 2.0 + 0.5) / n * 360.0 - 180.0
+        val latCenter = tileYToLat((yMin + yMax) / 2, zoom)
+        val overPrague = latCenter in 50.02..50.13 && lonCenter in 14.30..14.52
+
+        if (overPrague) {
+            val asset = try {
                 context.assets.open("prague_roads.geojson").bufferedReader().use { it.readText() }.also {
-                    Log.d(TAG, "OSM roads loaded from asset: ${it.length} chars")
+                    Log.d(TAG, "OSM roads from asset (Prague): ${it.length} chars")
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "No bundled OSM asset: ${e.message}")
-                null
+            } catch (e: Exception) { null }
+            if (asset != null) {
+                synchronized(cachedOsmByBbox) { cachedOsmByBbox[bboxKey] = asset }
+                return asset
             }
         }
-        if (cachedOsmGeoJson != null) return cachedOsmGeoJson
         
         // Fallback: fetch from Overpass API
         return try {
@@ -1038,8 +1046,9 @@ class NativeMapView(private val context: Context,
             val responseText = conn.inputStream.bufferedReader().use { it.readText() }
             Log.d(TAG, "OSM response: ${responseText.length} chars")
             
-            // Parse JSON and convert to GeoJSON FeatureCollection
-            osmToGeoJson(responseText)
+            val result = osmToGeoJson(responseText)
+            synchronized(cachedOsmByBbox) { cachedOsmByBbox[bboxKey] = result }
+            result
         } catch (e: Exception) {
             Log.w(TAG, "OSM fetch failed: ${e.message}")
             null
