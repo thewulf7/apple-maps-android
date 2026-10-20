@@ -55,10 +55,18 @@ private const val CH_LABEL_META       = 0x0d
 private const val CH_VERTICES         = 0x14
 private const val CH_POINT_FEATURES   = 0x1e
 private const val CH_LINE_FEATURES    = 0x1f
-private const val CH_POLY_LAND        = 0x20
-private const val CH_POLY_WATER       = 0x21
-private const val CH_POLY_PARK        = 0x22
-private const val CH_POLY_BUILDING    = 0x24
+// Chapter type constants confirmed from _readPolygons.c decompile (Oct 20 2026):
+// 0x20 = land + all area features (primary polygon chapter, always present)
+// 0x21 = legacy water/park polygons (only present when 0x68 modern buildings is ABSENT)
+// 0x22 = coastline new format
+// 0x26 = coastline old format
+// 0x68 = modern buildings (when present, tile uses 0x20 only; 0x21 absent)
+// In _readPolygons: always decode 0x20; if 0x68 present → modern buildings; else decode 0x21
+private const val CH_POLY_LAND        = 0x20   // always: land + area features
+private const val CH_POLY_LEGACY_WATER_PARK = 0x21  // only when no 0x68: water/park
+private const val CH_POLY_COASTLINE_NEW = 0x22
+private const val CH_POLY_BUILDING    = 0x24   // (rare/unused in observed tiles)
+private const val CH_MODERN_BUILDINGS_VADDR = 0x68  // modern buildings (replaces 0x21 path)
 private const val CH_COASTLINE        = 0x26
 private const val CH_POLY_CHAR_LINE   = 0x33
 private const val CH_POLY_CHAR_POLY   = 0x34
@@ -260,7 +268,9 @@ private fun decodeLineFeatures(
     val features = mutableListOf<VectorTileFeature>()
 
     for (i in 0 until roadCount.toInt()) {
-        // Per-feature: 1 byte = (hi nibble=labelCount | lo nibble=shieldCount)
+        // Per-feature: 1 byte bitstream (4b labelCount | 4b shieldCount), byte-aligned
+        // From _readLines decompile: bitstreamInitFromChapter + BitstreamUnpack(4) + BitstreamUnpack(4) + byteAlign
+        // Net result = same as reading 1 raw byte. Guard EOF on both the byte and subsequent varints.
         if (pos >= lineCh.size) break
         val byte0 = lineCh[pos++].toInt() and 0xff
         val featLabels  = (byte0 ushr 4) and 0xf
@@ -270,9 +280,11 @@ private fun decodeLineFeatures(
         val shields = mutableListOf<Pair<String, Long>>()
 
         for (j in 0 until featLabels) {
+            if (pos >= lineCh.size) break
             val (strOff, p7) = readVarUint32(lineCh, pos); pos = p7
+            if (pos >= lineCh.size) break
             val (strLen, p8) = readVarUint32(lineCh, pos); pos = p8
-            val text = if (strOff < stringPool.size) {
+            val text = if (strOff > 0L && strOff < stringPool.size) {
                 if (strLen == 0L) readNullTermStr(stringPool, strOff.toInt())
                 else String(stringPool, strOff.toInt(), strLen.toInt().coerceAtMost(stringPool.size - strOff.toInt()), Charsets.UTF_8)
             } else ""
@@ -280,9 +292,11 @@ private fun decodeLineFeatures(
         }
 
         for (j in 0 until featShields) {
+            if (pos >= lineCh.size) break
             val (strOff, p7) = readVarUint32(lineCh, pos); pos = p7
+            if (pos >= lineCh.size) break
             val (shieldId, p8) = readVarUint64(lineCh, pos); pos = p8
-            val text = if (strOff < stringPool.size) readNullTermStr(stringPool, strOff.toInt()) else ""
+            val text = if (strOff > 0L && strOff < stringPool.size) readNullTermStr(stringPool, strOff.toInt()) else ""
             shields.add(Pair(text, shieldId))
         }
 
@@ -495,20 +509,32 @@ fun decodeVmp4Tile(data: ByteArray, tileZ: Int, tileX: Int, tileY: Int): VectorT
         catch (e: Exception) { Log.w(TAG, "Line decode error: $e"); emptyList() }
     } ?: emptyList()
 
-    // Polygon features by chapter type
+    // Polygon features — mirroring geo_codec__readPolygons logic (confirmed from decompile):
+    // 1. Always decode 0x20 (land + all area features)
+    // 2. If 0x68 (modern buildings) chapter present → decode it as buildings, SKIP 0x21
+    // 3. Else → decode 0x21 (legacy water/park) if present
     val polygonFeatures = mutableMapOf<Int, List<VectorTileFeature>>()
-    val polyChapterTypes = listOf(
-        CH_POLY_LAND     to FeatureType.LAND,
-        CH_POLY_WATER    to FeatureType.WATER,
-        CH_POLY_PARK     to FeatureType.PARK,
-        CH_POLY_BUILDING to FeatureType.BUILDING,
-    )
-    for ((chType, fType) in polyChapterTypes) {
-        byType[chType]?.firstOrNull()?.let { ch ->
+
+    byType[CH_POLY_LAND]?.firstOrNull()?.let { ch ->
+        try {
+            val feats = decodePolygonFeatures(ch, vtxByIndex, stringPool, FeatureType.LAND, tileX, tileY, tileZ)
+            if (feats.isNotEmpty()) polygonFeatures[CH_POLY_LAND] = feats
+        } catch (e: Exception) { Log.w(TAG, "Poly[0x20] decode error: $e") }
+    }
+
+    val hasModernBuildings = byType[CH_MODERN_BUILDINGS_VADDR] != null
+    if (hasModernBuildings) {
+        // Modern buildings chapter (0x68) present — skip legacy water/park path
+        // TODO: decode 0x68 modern buildings when format is understood
+        Log.d(TAG, "Modern buildings chapter 0x68 present (skipping legacy 0x21)")
+    } else {
+        // Legacy path: 0x21 = water + park polygons
+        byType[CH_POLY_LEGACY_WATER_PARK]?.firstOrNull()?.let { ch ->
             try {
-                val feats = decodePolygonFeatures(ch, vtxByIndex, stringPool, fType, tileX, tileY, tileZ)
-                if (feats.isNotEmpty()) polygonFeatures[chType] = feats
-            } catch (e: Exception) { Log.w(TAG, "Poly[$chType] decode error: $e") }
+                val feats = decodePolygonFeatures(ch, vtxByIndex, stringPool, FeatureType.WATER, tileX, tileY, tileZ)
+                if (feats.isNotEmpty()) polygonFeatures[CH_POLY_LEGACY_WATER_PARK] = feats
+                Log.d(TAG, "Legacy water/park 0x21: ${feats.size} features")
+            } catch (e: Exception) { Log.w(TAG, "Poly[0x21] decode error: $e") }
         }
     }
 
