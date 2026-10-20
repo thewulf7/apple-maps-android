@@ -181,20 +181,24 @@ class NativeMapView(private val context: Context,
                         PropertyFactory.lineOpacity(0.5f),
                     ))
                 }
-                // VMP4-based park layer (fallback, less accurate)
-                // style.addLayer(FillLayer("l-park", SRC_POLY).withProperties(...
-                // VMP4 polygon centroid sampling occasionally misclassifies → garbled green/blue blobs.
-                // The style99 raster (placed above l-land) handles both water and park coloring.
-                // style.addLayer(FillLayer("l-park", SRC_POLY).withProperties(
-                //     PropertyFactory.fillColor("#B9D89B"),
-                //     PropertyFactory.fillOpacity(1.0f),
-                // ).withFilter(
-                //     Expression.raw("[\"in\",[\"get\",\"ft\"],[\"literal\",[40,64,65]]]")
-                // ))
-                // Water — blue (also disabled, handled by style99 raster)
-                // style.addLayer(FillLayer("l-water", SRC_POLY).withProperties(...)
-                // VMP4 small polygons (embankments, island shores, park features) — subtle render
-                // These are small geographic features, not individual buildings.
+                // VMP4-based water layer — ENABLED (native style attribute key=71 classification)
+                // key71=2 → ft=WATER(0x02), key71=1,5 → ft=PARK(0x03), else → ft=LAND(0x01)
+                // Validated Oct 20 2026 against 27 real Prague z14 tiles
+                style.addLayer(FillLayer("l-water-vmp4", SRC_POLY).withProperties(
+                    PropertyFactory.fillColor("#B5D8EA"),   // Water — Apple Maps steel blue
+                    PropertyFactory.fillOpacity(1.0f),
+                    PropertyFactory.fillAntialias(true),
+                ).withFilter(
+                    Expression.raw("""["==",["get","ft"],${FeatureType.WATER.toInt() and 0xff}]""")
+                ))
+                // VMP4-based park layer — ENABLED (native style attribute key=71 classification)
+                style.addLayer(FillLayer("l-park-vmp4", SRC_POLY).withProperties(
+                    PropertyFactory.fillColor("#C4D9A8"),   // Park — Apple Maps sage green
+                    PropertyFactory.fillOpacity(1.0f),
+                    PropertyFactory.fillAntialias(true),
+                ).withFilter(
+                    Expression.raw("""["==",["get","ft"],${FeatureType.PARK.toInt() and 0xff}]""")
+                ))
                 // Buildings require OSM data or z16 VMP4 tiles — deferred.
                 style.addLayer(FillLayer("l-building", SRC_POLY).withProperties(
                     PropertyFactory.fillColor("#EDE7DC"),       // very slightly darker than land
@@ -912,7 +916,7 @@ class NativeMapView(private val context: Context,
 
     /** Fetch + decode a VMP4 tile using the validated real-format decoder */
     private suspend fun fetchAndParseVmp4(z: Int, x: Int, y: Int, style: Int = 1): VectorTile? {
-        val key = "$z/$x/$y/s${style}_v3"
+        val key = "$z/$x/$y/s${style}_v4"
         synchronized(tileCache) { tileCache[key] }?.let { return it }
         return try {
             val assetName = "tile_${z}_${x}_${y}_s${style}.bin"

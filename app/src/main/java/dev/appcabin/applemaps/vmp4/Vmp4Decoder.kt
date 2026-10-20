@@ -366,6 +366,7 @@ private fun decodePolygonFeatures(
 
     for (i in 0 until featureCount.toInt()) {
         if (pos >= polyCh.size) break
+        var inlineFeatureType = featureType  // overridden per-feature by style attrs
 
         // hp_readLabel: encodedLabelCount (LEB128) + N×(textOffset + unusedValue) LEB128 pairs
         val (encodedLabelCount, p5) = readVarUint32(polyCh, pos); pos = p5
@@ -393,7 +394,25 @@ private fun decodePolygonFeatures(
         if (flags and 0x10 != 0) { pos += 4 }  // dispPriority (float, 4 bytes)
         if (flags and 0x08 != 0) {              // inlineStyleAttributes (accumulateStyleAttributes)
             val (addCnt, p9) = readVarUint32(polyCh, pos); pos = p9
-            repeat(addCnt.toInt()) { val (_, pa) = readVarUint32(polyCh, pos); pos = pa; val (_, pb) = readVarUint32(polyCh, pos); pos = pb }
+            // Collect style attributes — key 71 = area feature type discriminator:
+            //   71=2 → WATER (Vltava river, confirmed centroid lat=50.079 lon=14.407)
+            //   71=1 or 71=5 → PARK (Stromovka/Letná parks and river islands)
+            //   everything else → LAND (default urban/terrain polygons)
+            // Validated empirically against 27 real Prague z14 style=1 tiles (Oct 20 2026)
+            var styleKey71: Long? = null
+            repeat(addCnt.toInt()) {
+                val (styleKey, pa) = readVarUint32(polyCh, pos); pos = pa
+                val (styleVal, pb) = readVarUint32(polyCh, pos); pos = pb
+                if (styleKey == 71L) styleKey71 = styleVal
+            }
+            // Override featureType based on native style attribute
+            if (styleKey71 != null) {
+                inlineFeatureType = when (styleKey71) {
+                    2L    -> FeatureType.WATER
+                    1L, 5L -> FeatureType.PARK
+                    else  -> featureType  // keep caller-supplied default (LAND)
+                }
+            }
             val (remCnt, pc2) = readVarUint32(polyCh, pos); pos = pc2
             repeat(remCnt.toInt()) { val (_, pd) = readVarUint32(polyCh, pos); pos = pd }
         }
@@ -416,7 +435,7 @@ private fun decodePolygonFeatures(
         rp += pc
 
         features.add(VectorTileFeature(
-            featureType = featureType,
+            featureType = inlineFeatureType,
             geometry    = geometry,
             labels      = labels,
             shields     = emptyList(),
