@@ -325,7 +325,7 @@ fun AppleMapsScreen(
                         onResultClick = { result ->
                             if (result.lat != 0.0 && result.lng != 0.0) {
                                 mapCenter = LatLng(result.lat, result.lng)
-                                mapZoom = 16f
+                                mapZoom = 15f
                                 searchPin = LatLng(result.lat, result.lng)
                                 selectedPlace = result
                                 searchQuery = result.name

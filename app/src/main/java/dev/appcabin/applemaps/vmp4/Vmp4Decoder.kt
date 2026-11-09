@@ -454,7 +454,6 @@ fun VectorTile.toGeoJson(): Pair<String, String> {
     val polySb = StringBuilder("""{"type":"FeatureCollection","features":[""")
     val lineSb = StringBuilder("""{"type":"FeatureCollection","features":[""")
     var pf = true; var lf = true
-    Log.d("Vmp4Decoder", "toGeoJson: polyChs=${polygonFeatures.size} lineFts=${lineFeatures.size} polyFtsCounts=${polygonFeatures.entries.map{it.value.size}}")
 
     fun appendCoord(sb: StringBuilder, ll: LatLon) {
         sb.append("[%.6f,%.6f]".format(java.util.Locale.US, ll.lon, ll.lat))
@@ -477,7 +476,7 @@ fun VectorTile.toGeoJson(): Pair<String, String> {
             // Close ring
             polySb.append(','); appendCoord(polySb, ring.first())
             polySb.append("""]]},""")
-            polySb.append(""""properties":{"ft":$ftTag,"label":"${label.replace("\"", "\\\"")}","ch":$chType}}""")
+            polySb.append(""""properties":{"ft":$ftTag,"label":"${label.jsonStr()}","ch":$chType}}""")
         }
     }
     polySb.append("]}")
@@ -497,12 +496,27 @@ fun VectorTile.toGeoJson(): Pair<String, String> {
                 appendCoord(lineSb, ll)
             }
             lineSb.append("""]},""")
-            lineSb.append(""""properties":{"ft":$ftTag,"label":"${label.replace("\"", "\\\"")}","shield":"${shieldText.replace("\"", "\\\"")}","highway":"road"}}""")
+            lineSb.append(""""properties":{"ft":$ftTag,"label":"${label.jsonStr()}","shield":"${shieldText.jsonStr()}","highway":"road"}}""")
         }
     }
     lineSb.append("]}")
 
     return Pair(polySb.toString(), lineSb.toString())
+}
+
+// Sanitize a raw VMP4 string for embedding in JSON: NULs/control chars and
+// quotes/backslashes would otherwise poison the whole FeatureCollection parse.
+private fun String.jsonStr(): String {
+    val sb = StringBuilder(length)
+    for (c in this) {
+        when {
+            c < ' ' || c == '\u007f' -> {} // drop control chars incl. NUL
+            c == '"' -> sb.append("\\\"")
+            c == '\\' -> sb.append("\\\\")
+            else -> sb.append(c)
+        }
+    }
+    return sb.toString()
 }
 
 fun decodeVmp4Tile(data: ByteArray, tileZ: Int, tileX: Int, tileY: Int): VectorTile {

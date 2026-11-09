@@ -357,7 +357,22 @@ class NativeMapView(private val context: Context,
                     PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["service","living_street"]]]""")))
-                // Road name labels — only on features that have a name property
+                // VMP4 fallback roads — used when OSM fetch fails/times out (any location).
+                // VMP4 lines carry highway:"road" (no class info) — single neutral style.
+                style.addLayer(LineLayer("l-road-vmp4-case", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#94907F"),  // VectorKit road-casing
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 2.5f), Expression.stop(15, 6f), Expression.stop(17, 10f))),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["==",["get","highway"],"road"]""")))
+                style.addLayer(LineLayer("l-road-vmp4-fill", SRC_LINE).withProperties(
+                    PropertyFactory.lineColor("#FFFEF5"),  // VectorKit warm road fill
+                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 1f), Expression.stop(15, 3.5f), Expression.stop(17, 6f))),
+                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                ).withFilter(Expression.raw("""["==",["get","highway"],"road"]""")))
                 // Road name labels — crisp, Apple Maps style with strong halos
                 style.addLayer(SymbolLayer("l-label-road-major", SRC_LINE).withProperties(
                     PropertyFactory.textField(Expression.get("name")),
@@ -774,6 +789,20 @@ class NativeMapView(private val context: Context,
             }
             jobs.mapNotNull { it.await() }.let { results.addAll(it) }
 
+            // Style 20 = dense road network overlay (Apple pairs it with style 1).
+            // Lines only — used in the VMP4 fallback when OSM roads are unavailable.
+            val roadJobs = mutableListOf<Deferred<String>>()
+            for (x in vmpXMin..vmpXMax) for (y in vmpYMin..vmpYMax) {
+                val tx = x; val ty = y
+                roadJobs.add(async {
+                    fetchAndParseVmp4(vmpZ, tx, ty, style = 20)?.let { t ->
+                        // strip wrapper, keep feature list
+                        t.toGeoJson().second
+                            .removePrefix("""{"type":"FeatureCollection","features":[""").removeSuffix("]}")
+                    } ?: ""
+                })
+            }
+
             val polySb = StringBuilder("""{"type":"FeatureCollection","features":[""")
             val lineSb = StringBuilder("""{"type":"FeatureCollection","features":[""")
             val pointSb = StringBuilder("""{"type":"FeatureCollection","features":[""")
@@ -783,7 +812,6 @@ class NativeMapView(private val context: Context,
                 val (tx, ty, vtile) = tile
                 // Use new Vmp4Decoder — real Apple format with validated vertex codec
                 val (tilePolyJson, tileLineJson) = vtile.toGeoJson()
-                Log.d(TAG, "Tile toGeoJson: poly=${tilePolyJson.length} line=${tileLineJson.length}")
                 // Merge into overall FeatureCollections
                 // Strip outer wrapper and extract features array content
                 val polyFeats = tilePolyJson.removePrefix("""{"type":"FeatureCollection","features":[""").removeSuffix("]}")
@@ -802,8 +830,13 @@ class NativeMapView(private val context: Context,
             val osmRoadsJson = osmJob.await()
             val polyJson = polySb.toString()
             val emptyGeoJson = """{"type":"FeatureCollection","features":[]}"""
+            // Dense style-20 road lines (VMP4 fallback when OSM unavailable)
+            val vmpRoadFeats = roadJobs.map { it.await() }.filter { it.isNotEmpty() }.joinToString(",")
             // Prefer OSM roads (richer classification) but fall back to VMP4 road lines
-            val lineJson = osmRoadsJson ?: if (lineSb.length > 50) lineSb.toString() else emptyGeoJson
+            val lineJson = osmRoadsJson
+                ?: if (vmpRoadFeats.length > 10) """{"type":"FeatureCollection","features":[$vmpRoadFeats]}"""
+                else if (lineSb.length > 50) lineSb.toString()
+                else emptyGeoJson
             val pointJson = pointSb.toString()
 
             withContext(Dispatchers.Main) {
@@ -845,9 +878,6 @@ class NativeMapView(private val context: Context,
                 null
             } else {
                 val tile = decodeVmp4Tile(bytes, z, x, y)
-                val polyCount = tile.polygonFeatures.values.sumOf { it.size }
-                val lineCount = tile.lineFeatures.size
-                Log.d(TAG, "Tile $key: polys=$polyCount lines=$lineCount")
                 synchronized(tileCache) { tileCache[key] = tile }
                 tile
             }
@@ -939,8 +969,8 @@ class NativeMapView(private val context: Context,
                 .openConnection() as java.net.HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
-            conn.connectTimeout = 12000
-            conn.readTimeout = 12000
+            conn.connectTimeout = 15000
+            conn.readTimeout = 45000   // dense cities (Berlin) can take >20s on Overpass
             conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
             conn.setRequestProperty("User-Agent", "AppleMapsAndroid/1.0")
             Log.d(TAG, "OSM query for bbox: $latSouth,$lonWest,$latNorth,$lonEast")
@@ -978,61 +1008,33 @@ class NativeMapView(private val context: Context,
     private fun osmToGeoJson(overpassJson: String): String {
         val sb = StringBuilder("""{"type":"FeatureCollection","features":[""")
         var first = true
-        
         try {
-            // Simple JSON parsing without full library — extract ways
-            val elementsStart = overpassJson.indexOf("\"elements\":")
-            if (elementsStart < 0) return """{"type":"FeatureCollection","features":[]}"""
-            
-            var pos = overpassJson.indexOf('[', elementsStart)
-            var depth = 0
-            val elements = StringBuilder()
-            while (pos < overpassJson.length) {
-                val ch = overpassJson[pos]
-                if (ch == '[' || ch == '{') depth++
-                if (ch == ']' || ch == '}') depth--
-                elements.append(ch)
-                pos++
-                if (depth == 0) break
-            }
-            
-            // Extract each way object
-            val wayRegex = Regex("""\{"type":"way".*?"geometry":\[.*?\]\}""", RegexOption.DOT_MATCHES_ALL)
-            for (match in wayRegex.findAll(overpassJson)) {
-                val wayStr = match.value
-                
-                // Extract highway tag
-                val hwMatch = Regex(""""highway":"([^"]+)"""").find(wayStr) ?: continue
-                val hw = hwMatch.groupValues[1]
-                
-                // Extract geometry array
-                val geomStart = wayStr.indexOf("\"geometry\":[")
-                if (geomStart < 0) continue
-                val geomEnd = wayStr.indexOf("]", geomStart + 12)
-                if (geomEnd < 0) continue
-                val geomStr = wayStr.substring(geomStart + 12, geomEnd)
-                
-                // Parse lat/lon pairs
+            // org.json handles pretty-printed Overpass output (spaces after ':'),
+            // which the old indexOf("\"geometry\":[") matcher silently rejected.
+            val elements = org.json.JSONObject(overpassJson).getJSONArray("elements")
+            for (i in 0 until elements.length()) {
+                val way = elements.getJSONObject(i)
+                if (way.optString("type") != "way") continue
+                val tags = way.optJSONObject("tags") ?: continue
+                val hw = tags.optString("highway")
+                if (hw.isEmpty()) continue
+                val geometry = way.optJSONArray("geometry") ?: continue
                 val coords = StringBuilder()
-                var firstCoord = true
-                val nodeRegex = Regex(""""lat":(-?[0-9.]+),"lon":(-?[0-9.]+)""")
-                for (node in nodeRegex.findAll(geomStr)) {
-                    val lat = node.groupValues[1]; val lon = node.groupValues[2]
-                    if (!firstCoord) coords.append(',')
-                    coords.append("[$lon,$lat]")
-                    firstCoord = false
+                for (j in 0 until geometry.length()) {
+                    val node = geometry.getJSONObject(j)
+                    if (!node.has("lat") || !node.has("lon")) continue
+                    if (coords.isNotEmpty()) coords.append(',')
+                    coords.append("[${node.getDouble("lon")},${node.getDouble("lat")}]")
                 }
-                
-                if (firstCoord) continue  // no coords found
-                
+                if (coords.isEmpty()) continue
                 if (!first) sb.append(',')
                 first = false
-                sb.append("""{"type":"Feature","geometry":{"type":"LineString","coordinates":[$coords]},"properties":{"highway":"$hw"}}""")
+                val safeHw = hw.replace("\"", "")
+                sb.append("""{"type":"Feature","geometry":{"type":"LineString","coordinates":[$coords]},"properties":{"highway":"$safeHw"}}""")
             }
         } catch (e: Exception) {
             Log.w(TAG, "OSM JSON parse error: ${e.message}")
         }
-        
         sb.append("]}")
         return sb.toString()
     }
