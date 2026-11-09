@@ -16,8 +16,9 @@ import kotlin.random.Random
 object NativeAuth {
     // Hardcoded in GeoServices binary
     private const val TOKEN_P1 = "4cjLaD4jGRwlQ9U"
-    // From resource manifest field 31
-    private const val TOKEN_P2 = "72xIzEBe0vHBmf9"
+    // Token part 2 lives in resource manifest field 30; ResourceManifest
+    // refreshes it at startup (its initial value is the pre-manifest fallback).
+    private val tokenP2: String get() = ResourceManifest.tokenP2
 
     private val sessionId = buildString {
         repeat(40) { append(Random.nextInt(10)) }
@@ -27,7 +28,7 @@ object NativeAuth {
 
     fun signUrl(url: String): String {
         val p3 = buildString { repeat(16) { append(chars.random()) } }
-        val token = TOKEN_P1 + TOKEN_P2 + p3
+        val token = TOKEN_P1 + tokenP2 + p3
         val ts = (System.currentTimeMillis() / 1000) + 4200
 
         val qIdx = url.indexOf('?')
@@ -46,39 +47,17 @@ object NativeAuth {
         return "$url${sep}sid=$sessionId&accessKey=${ts}_${p3}_$encoded"
     }
 
-    /** Standard vector map tile URL (VMP4 format)
-     *  style 1  → flags=8, v=20028707 (polygons + sparse roads)
-     *  style 20 → no flags, v=20027943 (dense road network overlay)
+    /** Standard vector map tile URL (VMP4 format).
+     *  Version comes from the live resource manifest (Apple rotates it weekly;
+     *  stale versions answer 410 Gone). Caller must ensure ResourceManifest
+     *  is loaded — version() returns 0 before that, which the server rejects.
      */
     fun vectorTileUrl(z: Int, x: Int, y: Int, style: Int = 1): String {
+        val v = ResourceManifest.version(style)
         val base = when (style) {
-            20 -> "https://gspe19-ssl.ls.apple.com/tile.vf?style=20&size=2&scale=0&v=20027943&z=$z&x=$x&y=$y"
-            else -> "https://gspe19-ssl.ls.apple.com/tile.vf?flags=8&style=$style&size=2&scale=0&v=20028707&z=$z&x=$x&y=$y"
+            20 -> "https://gspe19-ssl.ls.apple.com/tile.vf?style=20&size=2&scale=0&v=$v&z=$z&x=$x&y=$y"
+            else -> "https://gspe19-ssl.ls.apple.com/tile.vf?flags=8&style=$style&size=2&scale=0&v=$v&z=$z&x=$x&y=$y"
         }
-        return signUrl(base)
-    }
-
-    /** Satellite raster tile URL (JPEG) */
-    fun satelliteTileUrl(z: Int, x: Int, y: Int, version: Int = 10441): String {
-        val base = "https://gspe11-ssl.ls.apple.com/tile?style=7&size=2&scale=0&v=$version&z=$z&x=$x&y=$y"
-        return signUrl(base)
-    }
-
-    /** Road overlay tile URL (VMP4) */
-    fun roadOverlayTileUrl(z: Int, x: Int, y: Int, version: Int = 20028707): String {
-        val base = "https://gspe19-ssl.ls.apple.com/tile.vf?flags=8&style=1&size=2&scale=0&v=$version&z=$z&x=$x&y=$y"
-        return signUrl(base)
-    }
-
-    /**
-     * Style 99 tile URL — per-pixel style class raster (16-bit PNG).
-     * Values: 0=land, 1=water, 2=park, 3-4=water variants.
-     * Version 654 confirmed from macOS ActiveTileGroup.pbd (Sep 2026).
-     *
-     * Endpoint: gspe11-ssl.ls.apple.com (raster tile CDN, different from VMP4 gspe19)
-     */
-    fun style99TileUrl(z: Int, x: Int, y: Int): String {
-        val base = "https://gspe11-ssl.ls.apple.com/tile?style=99&size=2&scale=0&v=654&z=$z&x=$x&y=$y"
         return signUrl(base)
     }
 }

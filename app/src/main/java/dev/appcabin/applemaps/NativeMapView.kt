@@ -1,7 +1,6 @@
 package dev.appcabin.applemaps
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.util.Log
 import io.ktor.client.*
 import io.ktor.client.request.*
@@ -19,9 +18,7 @@ import org.maplibre.android.maps.MapLibreMapOptions
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.*
-import org.maplibre.android.geometry.LatLngQuad
 import org.maplibre.android.style.sources.GeoJsonSource
-import org.maplibre.android.style.sources.ImageSource
 import dev.appcabin.applemaps.vmp4.*
 import kotlin.math.floor
 import kotlin.math.ln
@@ -50,12 +47,6 @@ class NativeMapView(private val context: Context,
     private val tileCache = object : LinkedHashMap<String, VectorTile>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, VectorTile>?) = size > 256
     }
-    /** Per-tile style 99 ft maps: key="z/x/y", value=IntArray[512*512] of ft values */
-    private val style99Cache = object : LinkedHashMap<String, IntArray>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, IntArray>?) = size > 256
-    }
-    /** Track which style99 image sources have been added to the MapLibre style (avoid duplicates). */
-    private val style99Added = mutableSetOf<String>()
     val mapView: MapView
 
     init {
@@ -751,11 +742,14 @@ class NativeMapView(private val context: Context,
         Log.d(TAG, "Loading $tileCount tiles z=$zoom x=$xMin..$xMax y=$yMin..$yMax | bounds lon=[${bounds.longitudeWest.round(4)},${bounds.longitudeEast.round(4)}] lat=[${bounds.latitudeSouth.round(4)},${bounds.latitudeNorth.round(4)}]")
 
         scope.launch {
+            // Tile versions rotate weekly (Apple answers 410 for stale ones).
+            // Ensure the resource manifest is loaded before any tile request.
+            ResourceManifest.ensureLoaded(client)
+
             // Fetch style 1 (polygons), style 20 (roads)
             data class TileResult(val x: Int, val y: Int, val tile: VectorTile)
             val results = mutableListOf<TileResult>()
             val jobs = mutableListOf<Deferred<TileResult?>>()
-            val style99Jobs = mutableListOf<Deferred<Pair<String, IntArray?>>>()
 
             // Style 1 = base polygons/roads. Apple VMP4 polygon/road data is at z=14.
             // At z≥14: request z=14 parent tiles for VMP4 decode; OSM roads layer handles z=15 detail.
@@ -777,26 +771,8 @@ class NativeMapView(private val context: Context,
                 for (style in styles) {
                     jobs.add(async { fetchAndParseVmp4(vmpZ, tx, ty, style = style)?.let { TileResult(tx, ty, it) } })
                 }
-                // Style 99 = per-pixel style class raster (water=1, park=2, land=0)
-                // Style 99 is ONLY available at z=14 (confirmed from ActiveTileGroup.pbd).
-                // For z>14: clamp to z=14 parent tile.
-                // For z<14: not available (no polygon data either at z<14).
-                val s99z = 14
-                val s99x = if (zoom <= 14) tx shr (14 - zoom) else tx shl (zoom - 14)
-                val s99y = if (zoom <= 14) ty shr (14 - zoom) else ty shl (zoom - 14)
-                val key99 = "$s99z/$s99x/$s99y"
-                if (zoom >= 13 && !synchronized(style99Cache) { style99Cache.containsKey(key99) }) {
-                    style99Jobs.add(async {
-                        key99 to fetchStyle99(s99z, s99x, s99y)
-                    })
-                }
             }
             jobs.mapNotNull { it.await() }.let { results.addAll(it) }
-            // Store style 99 results
-            style99Jobs.forEach { job ->
-                val (k, ftMap) = job.await()
-                if (ftMap != null) synchronized(style99Cache) { style99Cache[k] = ftMap }
-            }
 
             val polySb = StringBuilder("""{"type":"FeatureCollection","features":[""")
             val lineSb = StringBuilder("""{"type":"FeatureCollection","features":[""")
@@ -836,79 +812,6 @@ class NativeMapView(private val context: Context,
                     (s.getSource(SRC_LINE) as? GeoJsonSource)?.setGeoJson(lineJson)
                     (s.getSource(SRC_POINT) as? GeoJsonSource)?.setGeoJson(pointJson)
                     Log.d(TAG, "Updated map: poly=${polySb.length}, line=${lineJson.length}, point=${pointSb.length} chars")
-
-                    // Composite ALL loaded style99 tiles into ONE seamless bitmap
-                    // This eliminates seam lines between individual tile images
-                    val n14 = 1 shl 14
-                    val tileSize = 512
-                    val cols = xMax - xMin + 1
-                    val rows = yMax - yMin + 1
-
-                    // Collect tiles (map to z=14 coords)
-                    val tileGrid = Array(rows) { row -> Array(cols) { col ->
-                        val s99x = (xMin + col) shr (zoom - 14).coerceAtLeast(0)
-                        val s99y = (yMin + row) shr (zoom - 14).coerceAtLeast(0)
-                        synchronized(style99Cache) { style99Cache["14/$s99x/$s99y"] }
-                    }}
-
-                    // Check if all tiles loaded and composite changed
-                    val allLoaded = tileGrid.all { row -> row.all { it != null } }
-                    val compositeKey = "composite-$zoom-$xMin-$xMax-$yMin-$yMax"
-                    if (allLoaded && compositeKey !in style99Added) {
-                        // Build composite at 1× (512px tiles) with software Gaussian blur for edge AA.
-                        // 2× supersampling OOMed on device (4×4 grid @ 2× = 67MB just for pixel arrays).
-                        // 1× blur with radius=2 uses only ~6MB for a 5×5 grid — safe.
-                        // MapLibre rasterResampling=LINEAR handles sub-pixel smoothness during map rendering.
-                        val finalW = cols * tileSize; val finalH = rows * tileSize
-                        val compositePixels = IntArray(finalW * finalH)
-
-                        for (row in 0 until rows) for (col in 0 until cols) {
-                            val ftMap = tileGrid[row][col] ?: continue
-                            for (py in 0 until tileSize) for (px in 0 until tileSize) {
-                                val ft = ftMap[py * tileSize + px]
-                                val color = when (ft) {
-                                    94 -> 0xFF8FD3E8.toInt()   // water  #8FD3E8
-                                    64 -> 0xFFB9D89B.toInt()   // park   #B9D89B
-                                    else -> 0x00000000          // transparent
-                                }
-                                compositePixels[(row * tileSize + py) * finalW + (col * tileSize + px)] = color
-                            }
-                        }
-
-                        // No software blur — MapLibre LINEAR resampling handles edge smoothing.
-                        // Software blur was causing color bleed at water/park boundaries.
-                        // The style99 raster placed above l-land provides clean water/park coloring.
-                        val composite = Bitmap.createBitmap(finalW, finalH, Bitmap.Config.ARGB_8888)
-                        composite.setPixels(compositePixels, 0, finalW, 0, 0, finalW, finalH)
-
-                        // Remove any old composite source/layer
-                        style99Added.filter { it.startsWith("composite-") }.forEach { old ->
-                            try { s.removeLayer("l-s99-$old"); s.removeSource("s99-$old") } catch (_: Exception) {}
-                        }
-                        style99Added.removeAll { it.startsWith("composite-") }
-
-                        // Geographic bounds of the entire composite
-                        val lonMin = xMin.toDouble() / n14 * 360.0 - 180.0
-                        val lonMax = (xMax + 1).toDouble() / n14 * 360.0 - 180.0
-                        val latMax = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * yMin / n14))))
-                        val latMin = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * (yMax + 1).toDouble() / n14))))
-
-                        try {
-                            s.addSource(ImageSource("s99-$compositeKey", LatLngQuad(
-                                LatLng(latMax, lonMin), LatLng(latMax, lonMax),
-                                LatLng(latMin, lonMax), LatLng(latMin, lonMin)
-                            ), composite))
-                            // DISABLED: OSM vector water+parks now cover all features.
-                            // Style99 caused blue noise slivers (fountains/small water) in Josefov.
-                            // Keep the bitmap built for potential future use, but don't add the layer.
-                            // s.addLayerAbove(RasterLayer(...), "l-land")
-                            composite.recycle()
-                            Log.d(TAG, "Style99 composite built but NOT added (OSM vector takes over)")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed to add composite raster: ${e.message}")
-                            composite.recycle()
-                        }
-                    }
                 }
             }
         }
@@ -916,7 +819,7 @@ class NativeMapView(private val context: Context,
 
     /** Fetch + decode a VMP4 tile using the validated real-format decoder */
     private suspend fun fetchAndParseVmp4(z: Int, x: Int, y: Int, style: Int = 1): VectorTile? {
-        val key = "$z/$x/$y/s${style}_v5"
+        val key = "$z/$x/$y/s${style}_v6"
         synchronized(tileCache) { tileCache[key] }?.let { return it }
         return try {
             val assetName = "tile_${z}_${x}_${y}_s${style}.bin"
@@ -925,8 +828,17 @@ class NativeMapView(private val context: Context,
                     Log.d(TAG, "Tile $key: loaded from asset $assetName (${it.size}b)")
                 }
             } catch (_: Exception) {
-                val url = NativeAuth.vectorTileUrl(z, x, y, style = style)
-                client.get(url).bodyAsBytes()
+                var url = NativeAuth.vectorTileUrl(z, x, y, style = style)
+                var resp = client.get(url)
+                if (resp.status.value == 410) {
+                    // Tile version rotated mid-session — refresh manifest, retry once.
+                    Log.w(TAG, "Tile $key: 410 Gone, refreshing manifest")
+                    ResourceManifest.requestRefresh()
+                    ResourceManifest.ensureLoaded(client)
+                    url = NativeAuth.vectorTileUrl(z, x, y, style = style)
+                    resp = client.get(url)
+                }
+                resp.bodyAsBytes()
             }
             if (bytes.size < 8 || bytes[0] != 'V'.code.toByte()) {
                 Log.w(TAG, "Tile $key: not VMP4, ${bytes.size}b")
@@ -1199,28 +1111,6 @@ class NativeMapView(private val context: Context,
         }
     }
 
-    /** Fetch and decode style 99 tile (per-pixel style class raster). */
-    private suspend fun fetchStyle99(z: Int, x: Int, y: Int): IntArray? {
-        return try {
-            val url = NativeAuth.style99TileUrl(z, x, y)
-            val bytes = client.get(url).bodyAsBytes()
-            if (bytes.size < 8) {
-                Log.w(TAG, "Style99 $z/$x/$y: too small ${bytes.size}b")
-                null
-            } else {
-                Style99Decoder.decode(bytes).also { result ->
-                    if (result != null)
-                        Log.d(TAG, "Style99 $z/$x/$y: decoded ${result.size} pixels")
-                    else
-                        Log.w(TAG, "Style99 $z/$x/$y: decode failed")
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Style99 $z/$x/$y fetch failed: ${e.message}")
-            null
-        }
-    }
-
     private fun appendCoord(sb: StringBuilder, v: Vertex, tx: Int, ty: Int, z: Int) {
         val (lon, lat) = tileToWgs84(tx, ty, z, v.x, v.y)
         sb.append("[%.6f,%.6f]".format(java.util.Locale.US, lon, lat))
@@ -1232,123 +1122,6 @@ class NativeMapView(private val context: Context,
         return floor((1.0 - ln(Math.tan(r) + 1.0 / Math.cos(r)) / Math.PI) / 2.0 * n).toInt()
     }
 
-    /**
-     * Software separable box blur on a raw ARGB IntArray (2 passes: horizontal + vertical).
-     * Uses sliding-window sums: O(W×H) — not O(W×H×kernel) — regardless of radius.
-     * Used for anti-aliasing water/park edges in the style99 composite.
-     * radius=2 gives a ~2px soft edge — enough to remove the hard pixel-grid appearance.
-     * Memory: 3 IntArrays of finalW × finalH × 4 bytes (~6MB for a 5×5 tile grid).
-     */
-    private fun boxBlur2D(src: IntArray, w: Int, h: Int, radius: Int): IntArray {
-        val r = radius.coerceAtLeast(1)
-        val tmp = IntArray(w * h)
-
-        // Horizontal pass using sliding window: O(W×H) total
-        for (y in 0 until h) {
-            var aSum = 0; var rSum = 0; var gSum = 0; var bSum = 0
-            // Seed window [-r, 0)
-            for (dx in -r until 0) {
-                val p = src[y * w + 0]  // clamp left
-                aSum += (p ushr 24) and 0xFF; rSum += (p shr 16) and 0xFF
-                gSum += (p shr 8) and 0xFF; bSum += p and 0xFF
-            }
-            // Seed window [0, r]
-            for (dx in 0..r) {
-                val p = src[y * w + dx.coerceAtMost(w - 1)]
-                aSum += (p ushr 24) and 0xFF; rSum += (p shr 16) and 0xFF
-                gSum += (p shr 8) and 0xFF; bSum += p and 0xFF
-            }
-            val cnt = r * 2 + 1
-            for (x in 0 until w) {
-                tmp[y * w + x] = ((aSum / cnt) shl 24) or ((rSum / cnt) shl 16) or
-                                  ((gSum / cnt) shl 8) or (bSum / cnt)
-                // Slide: remove leftmost, add next right
-                val remove = src[y * w + (x - r).coerceAtLeast(0)]
-                val add    = src[y * w + (x + r + 1).coerceAtMost(w - 1)]
-                aSum += ((add ushr 24) and 0xFF) - ((remove ushr 24) and 0xFF)
-                rSum += ((add shr 16) and 0xFF) - ((remove shr 16) and 0xFF)
-                gSum += ((add shr 8) and 0xFF) - ((remove shr 8) and 0xFF)
-                bSum += (add and 0xFF) - (remove and 0xFF)
-            }
-        }
-        // Vertical pass using sliding window
-        val out = IntArray(w * h)
-        for (x in 0 until w) {
-            var aSum = 0; var rSum = 0; var gSum = 0; var bSum = 0
-            for (dy in -r until 0) {
-                val p = tmp[0 * w + x]  // clamp top
-                aSum += (p ushr 24) and 0xFF; rSum += (p shr 16) and 0xFF
-                gSum += (p shr 8) and 0xFF; bSum += p and 0xFF
-            }
-            for (dy in 0..r) {
-                val p = tmp[dy.coerceAtMost(h - 1) * w + x]
-                aSum += (p ushr 24) and 0xFF; rSum += (p shr 16) and 0xFF
-                gSum += (p shr 8) and 0xFF; bSum += p and 0xFF
-            }
-            val cnt = r * 2 + 1
-            for (y in 0 until h) {
-                out[y * w + x] = ((aSum / cnt) shl 24) or ((rSum / cnt) shl 16) or
-                                  ((gSum / cnt) shl 8) or (bSum / cnt)
-                val remove = tmp[(y - r).coerceAtLeast(0) * w + x]
-                val add    = tmp[(y + r + 1).coerceAtMost(h - 1) * w + x]
-                aSum += ((add ushr 24) and 0xFF) - ((remove ushr 24) and 0xFF)
-                rSum += ((add shr 16) and 0xFF) - ((remove shr 16) and 0xFF)
-                gSum += ((add shr 8) and 0xFF) - ((remove shr 8) and 0xFF)
-                bSum += (add and 0xFF) - (remove and 0xFF)
-            }
-        }
-        return out
-    }
-
-    /**
-     * Alpha-edge blur: blurs ONLY the alpha channel using a sliding-window box blur.
-     * RGB values are taken from the nearest fully-opaque pixel to avoid color bleed into land.
-     * This gives clean, soft edges without desaturating or bleeding water/park colors into land.
-     */
-    private fun alphaEdgeBlur(src: IntArray, w: Int, h: Int, radius: Int): IntArray {
-        val r = radius.coerceAtLeast(1)
-        val alphaOnly = IntArray(w * h) { i -> (src[i] ushr 24) and 0xFF }
-
-        // Horizontal blur on alpha
-        val tmpAlpha = IntArray(w * h)
-        for (y in 0 until h) {
-            var sum = 0
-            for (dx in -r until 0) sum += alphaOnly[y * w + 0]
-            for (dx in 0..r) sum += alphaOnly[y * w + dx.coerceAtMost(w - 1)]
-            val cnt = r * 2 + 1
-            for (x in 0 until w) {
-                tmpAlpha[y * w + x] = sum / cnt
-                sum -= alphaOnly[y * w + (x - r).coerceAtLeast(0)]
-                sum += alphaOnly[y * w + (x + r + 1).coerceAtMost(w - 1)]
-            }
-        }
-        // Vertical blur on alpha
-        val outAlpha = IntArray(w * h)
-        for (x in 0 until w) {
-            var sum = 0
-            for (dy in -r until 0) sum += tmpAlpha[0 * w + x]
-            for (dy in 0..r) sum += tmpAlpha[dy.coerceAtMost(h - 1) * w + x]
-            val cnt = r * 2 + 1
-            for (y in 0 until h) {
-                outAlpha[y * w + x] = sum / cnt
-                sum -= tmpAlpha[(y - r).coerceAtLeast(0) * w + x]
-                sum += tmpAlpha[(y + r + 1).coerceAtMost(h - 1) * w + x]
-            }
-        }
-
-        // Rebuild: keep RGB from original (or nearest opaque if transparent), blend alpha only
-        return IntArray(w * h) { i ->
-            val origAlpha = (src[i] ushr 24) and 0xFF
-            val blurAlpha = outAlpha[i]
-            if (origAlpha == 255 || blurAlpha == 0) {
-                // Fully opaque or invisible — just use blurred alpha with original RGB
-                (blurAlpha shl 24) or (src[i] and 0x00FFFFFF)
-            } else {
-                // Edge pixel: use original RGB (from the feature color) with blurred alpha
-                (blurAlpha shl 24) or (src[i] and 0x00FFFFFF)
-            }
-        }
-    }
 }
 
 private val BLANK_STYLE = """
