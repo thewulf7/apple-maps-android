@@ -319,10 +319,15 @@ private fun decodePointFeatures(
                 repeat(remN.toInt()) { val (_, pk) = readVarUint32(poiCh, pos); pos = pk }
             }
             val (rx, ry) = pool[firstPoint.toInt() + i]
+            val denom = poiNormDenom(vtxData)
+            // POI pool y is inverted vs. the polygon/line vertex convention
+            // (verified against hand-known Prague landmarks: Karlův most,
+            // Petřínská rozhledna, Pražský hrad, Katedrála sv. Víta all land
+            // within ~10m of ground truth only with this flip).
             feats.add(VectorTileFeature(
                 featureType = FeatureType.LAND, // POI label anchor
                 geometry = listOf(listOf(tileNormToLatLon(tileX, tileY, tileZ,
-                    rx.toDouble() / poiNormDenom(vtxData), ry.toDouble() / poiNormDenom(vtxData)))),
+                    rx.toDouble() / denom, 1.0 - (ry.toDouble() / denom)))),
                 labels = labels,
                 shields = emptyList(),
             ))
