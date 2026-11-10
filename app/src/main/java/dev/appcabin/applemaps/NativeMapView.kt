@@ -407,6 +407,21 @@ class NativeMapView(private val context: Context,
                     PropertyFactory.textAllowOverlap(false),
                     PropertyFactory.textFont(arrayOf("Open Sans Regular", "Arial Unicode MS Regular")),
                 ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["tertiary","residential","unclassified","living_street"]]]]""")))
+                // Native Apple POI labels (chapter 0x1e, style-13 tiles)
+                style.addLayer(SymbolLayer("l-poi-apple", SRC_POINT).withProperties(
+                    PropertyFactory.textField(Expression.get("label")),
+                    PropertyFactory.textSize(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 10.5f), Expression.stop(15, 12.5f), Expression.stop(17, 14f))),
+                    PropertyFactory.textColor("#3A3A3C"),
+                    PropertyFactory.textHaloColor("#FFFFFFCC"),
+                    PropertyFactory.textHaloWidth(1.4f),
+                    PropertyFactory.textOffset(arrayOf(0f, -0.9f)),
+                    PropertyFactory.textAllowOverlap(false),
+                    PropertyFactory.textOptional(true),
+                    PropertyFactory.iconAllowOverlap(false),
+                    PropertyFactory.textFont(arrayOf("Open Sans Semibold", "Arial Unicode MS Bold")),
+                ).withFilter(Expression.raw("""["all",["has","label"],["!=",["get","label"],""]]""")))
+                style.getLayer("l-poi-apple")?.minZoom = 13.5f
                 // Neighborhood / district labels
                 style.addLayer(SymbolLayer("l-label-places", SRC_PLACES).withProperties(
                     PropertyFactory.textField(Expression.get("name")),
@@ -803,6 +818,19 @@ class NativeMapView(private val context: Context,
                 })
             }
 
+            // Style 13 = POI labels (chapter 0x1e with rich string pool).
+            // Points only — style 1 has just 2-3 district labels per tile.
+            val poiJobs = mutableListOf<Deferred<String>>()
+            for (x in vmpXMin..vmpXMax) for (y in vmpYMin..vmpYMax) {
+                val tx = x; val ty = y
+                poiJobs.add(async {
+                    fetchAndParseVmp4(vmpZ, tx, ty, style = 13)?.let { t ->
+                        t.toPointGeoJson()
+                            .removePrefix("""{"type":"FeatureCollection","features":[""").removeSuffix("]}")
+                    } ?: ""
+                })
+            }
+
             val polySb = StringBuilder("""{"type":"FeatureCollection","features":[""")
             val lineSb = StringBuilder("""{"type":"FeatureCollection","features":[""")
             val pointSb = StringBuilder("""{"type":"FeatureCollection","features":[""")
@@ -832,19 +860,22 @@ class NativeMapView(private val context: Context,
             val emptyGeoJson = """{"type":"FeatureCollection","features":[]}"""
             // Dense style-20 road lines (VMP4 fallback when OSM unavailable)
             val vmpRoadFeats = roadJobs.map { it.await() }.filter { it.isNotEmpty() }.joinToString(",")
+            // POI labels from style-13 tiles (native Apple POI names)
+            val poiFeats = poiJobs.map { it.await() }.filter { it.isNotEmpty() }.joinToString(",")
             // Prefer OSM roads (richer classification) but fall back to VMP4 road lines
             val lineJson = osmRoadsJson
                 ?: if (vmpRoadFeats.length > 10) """{"type":"FeatureCollection","features":[$vmpRoadFeats]}"""
                 else if (lineSb.length > 50) lineSb.toString()
                 else emptyGeoJson
-            val pointJson = pointSb.toString()
+            val pointJson = if (poiFeats.length > 10) """{"type":"FeatureCollection","features":[$poiFeats]}"""
+                            else emptyGeoJson
 
             withContext(Dispatchers.Main) {
                 m.style?.let { s ->
                     (s.getSource(SRC_POLY) as? GeoJsonSource)?.setGeoJson(polyJson)
                     (s.getSource(SRC_LINE) as? GeoJsonSource)?.setGeoJson(lineJson)
                     (s.getSource(SRC_POINT) as? GeoJsonSource)?.setGeoJson(pointJson)
-                    Log.d(TAG, "Updated map: poly=${polySb.length}, line=${lineJson.length}, point=${pointSb.length} chars")
+                    Log.d(TAG, "Updated map: poly=${polyJson.length}, line=${lineJson.length}, point=${pointJson.length} chars")
                 }
             }
         }

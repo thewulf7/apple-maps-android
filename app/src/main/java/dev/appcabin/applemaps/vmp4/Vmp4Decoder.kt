@@ -26,6 +26,7 @@ data class VectorTile(
     val tileY: Int,
     val lineFeatures: List<VectorTileFeature>,
     val polygonFeatures: Map<Int, List<VectorTileFeature>>, // chapterType → features
+    val pointFeatures: List<VectorTileFeature> = emptyList(), // POI labels (chapter 0x1e)
 )
 
 // Feature type constants from attributesForFeatureType decompile
@@ -238,6 +239,107 @@ private fun decodeVertexChapter(ch: ByteArray): VtxPool {
     }
 
     return VtxPool(vertices, ranges, coordBits, coordBits) // normBits = coordBits (confirmed by decodeVertices.c)
+}
+
+// ─── POI vertex pool (geo_codec_readPois, chapter 0x14 referenced by section idx) ─
+// Plain format: varint pointCount, varint coordCount, then bitstream
+// 6b coordBits | 6b yBits(==0) | 4b reserved(==0) | 1b reserved(==0),
+// then per point rawX(coordBits) rawY(coordBits). No ranges, no deltas.
+
+private fun decodePoiVertexPool(ch: ByteArray): List<Pair<Int,Int>>? {
+    val (pointCount, p1) = readVarUint32(ch, 0)
+    val (coordCount, p2) = readVarUint32(ch, p1)
+    if (pointCount == 0L || pointCount != coordCount || pointCount > 65536) return null
+    val bs = BitReader(ch, p2 * 8)
+    val coordBits = bs.read(6)
+    if (bs.read(6) != 0 || bs.read(4) != 0 || bs.read(1) != 0) return null
+    if (coordBits == 0 || coordBits > 24) return null
+    val pts = ArrayList<Pair<Int,Int>>(pointCount.toInt())
+    repeat(pointCount.toInt()) {
+        val x = bs.read(coordBits)
+        val y = bs.read(coordBits)
+        pts.add(Pair(x, y))
+    }
+    return pts
+}
+
+// ─── POI feature decoder (geo_codec_readPois, chapter 0x1e) ──────────────────
+// Header: vertexChapterIndex | firstPointIndex | labelSpaceNeeded | featureCount.
+// Per feature (hp_readLabel + readFeatureOptionalFields):
+//   varint labelCount; per label: varint strOff + varint ignored
+//   flags byte (6 bits MSB-first): f0 u64, f1 u64, f2 float(priority),
+//   f3 varint, f4 varint(styleRecIdx), f5 stylePairs(addN pairs + remN keys)
+// Geometry is POSITIONAL: feature i uses vertexPool[firstPointIndex + i].
+
+private fun decodePointFeatures(
+    poiCh: ByteArray,
+    sections: List<Section>,
+    stringPool: ByteArray,
+    tileX: Int, tileY: Int, tileZ: Int,
+): List<VectorTileFeature> {
+    var pos = 0
+    val (vtxIdx, p1)       = readVarUint32(poiCh, pos); pos = p1
+    val (firstPoint, p2)   = readVarUint32(poiCh, pos); pos = p2
+    val (_, p3)            = readVarUint32(poiCh, pos); pos = p3 // labelSpaceNeeded
+    val (featureCount, p4) = readVarUint32(poiCh, pos); pos = p4
+
+    val vtxData = sections.getOrNull(vtxIdx.toInt())?.data ?: return emptyList()
+    val pool = decodePoiVertexPool(vtxData) ?: return emptyList()
+    if (pool.size - firstPoint.toInt() < featureCount.toInt()) return emptyList()
+
+    val feats = mutableListOf<VectorTileFeature>()
+    var i = 0
+    try {
+        while (i < featureCount.toInt()) {
+            val (labelCount, p5) = readVarUint32(poiCh, pos); pos = p5
+            val labels = mutableListOf<String>()
+            repeat(labelCount.toInt()) {
+                val (strOff, p6) = readVarUint32(poiCh, pos); pos = p6
+                val (_, p7)      = readVarUint32(poiCh, pos); pos = p7 // ignored
+                if (strOff in 1 until stringPool.size.toLong()) {
+                    labels.add(readNullTermStr(stringPool, strOff.toInt()))
+                } else if (strOff == 0L && stringPool.isNotEmpty()) {
+                    labels.add(readNullTermStr(stringPool, 0))
+                }
+            }
+            val flags = poiCh[pos].toInt() and 0xff; pos += 1
+            // f0: u64, f1: u64, f2: float priority, f3: varint, f4: styleRecIdx, f5: style pairs
+            if (flags and 0x80 != 0) pos += 8
+            if (flags and 0x40 != 0) pos += 8
+            if (flags and 0x20 != 0) pos += 4
+            if (flags and 0x10 != 0) { val (_, p) = readVarUint32(poiCh, pos); pos = p }
+            if (flags and 0x08 != 0) { val (_, p) = readVarUint32(poiCh, pos); pos = p }
+            if (flags and 0x04 != 0) {
+                val (addN, pa) = readVarUint32(poiCh, pos); pos = pa
+                repeat(addN.toInt()) {
+                    val (_, pk) = readVarUint32(poiCh, pos); pos = pk
+                    val (_, pv) = readVarUint32(poiCh, pos); pos = pv
+                }
+                val (remN, pr) = readVarUint32(poiCh, pos); pos = pr
+                repeat(remN.toInt()) { val (_, pk) = readVarUint32(poiCh, pos); pos = pk }
+            }
+            val (rx, ry) = pool[firstPoint.toInt() + i]
+            feats.add(VectorTileFeature(
+                featureType = FeatureType.LAND, // POI label anchor
+                geometry = listOf(listOf(tileNormToLatLon(tileX, tileY, tileZ,
+                    rx.toDouble() / poiNormDenom(vtxData), ry.toDouble() / poiNormDenom(vtxData)))),
+                labels = labels,
+                shields = emptyList(),
+            ))
+            i++
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "POI decode desync at $i/$featureCount: ${e.message}")
+    }
+    return feats
+}
+
+private fun poiNormDenom(vtxData: ByteArray): Long {
+    // coordBits lives after the two varints in the pool header
+    val (_, p1) = readVarUint32(vtxData, 0)
+    val (_, p2) = readVarUint32(vtxData, p1)
+    val bs = BitReader(vtxData, p2 * 8)
+    return ((1L shl bs.read(6)) - 1L).coerceAtLeast(1L)
 }
 
 // ─── Line feature decoder (_readLines) ───────────────────────────────────────
@@ -504,6 +606,23 @@ fun VectorTile.toGeoJson(): Pair<String, String> {
     return Pair(polySb.toString(), lineSb.toString())
 }
 
+// POI labels → point GeoJSON for SRC_POINT (chapter 0x1e, decoded positionally)
+fun VectorTile.toPointGeoJson(): String {
+    val sb = StringBuilder("""{"type":"FeatureCollection","features":[""")
+    var first = true
+    for (feat in pointFeatures) {
+        val name = feat.labels.firstOrNull()?.jsonStr() ?: continue
+        if (name.isEmpty()) continue
+        val pt = feat.geometry.firstOrNull()?.firstOrNull() ?: continue
+        if (!first) sb.append(','); first = false
+        sb.append("""{"type":"Feature","geometry":{"type":"Point","coordinates":[""")
+        sb.append("[%.6f,%.6f]".format(java.util.Locale.US, pt.lon, pt.lat))
+        sb.append("""]},"properties":{"label":"$name"}}""")
+    }
+    sb.append("]}")
+    return sb.toString()
+}
+
 // Sanitize a raw VMP4 string for embedding in JSON: NULs/control chars and
 // quotes/backslashes would otherwise poison the whole FeatureCollection parse.
 private fun String.jsonStr(): String {
@@ -571,9 +690,16 @@ fun decodeVmp4Tile(data: ByteArray, tileZ: Int, tileX: Int, tileY: Int): VectorT
         }
     }
 
+    // POI point features (chapter 0x1e) — labels + positional anchors
+    val pointFeatures = byType[CH_POINT_FEATURES]?.firstOrNull()?.let { ch ->
+        try { decodePointFeatures(ch, sections, stringPool, tileX, tileY, tileZ) }
+        catch (e: Exception) { Log.w(TAG, "POI decode error: $e"); emptyList() }
+    } ?: emptyList()
+
     return VectorTile(
         tileZ = tileZ, tileX = tileX, tileY = tileY,
         lineFeatures = lineFeatures,
         polygonFeatures = polygonFeatures,
+        pointFeatures = pointFeatures,
     )
 }

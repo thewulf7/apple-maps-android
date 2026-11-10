@@ -53,7 +53,7 @@ object ResourceManifest {
 
     /** Current version for a tile style. Falls back to any known version. */
     fun version(style: Int): Int =
-        versions[style] ?: versions.values.firstOrNull() ?: 0
+        versions[style] ?: versions[0] ?: versions.values.firstOrNull() ?: 0
 
     val isLoaded: Boolean get() = loaded
 
