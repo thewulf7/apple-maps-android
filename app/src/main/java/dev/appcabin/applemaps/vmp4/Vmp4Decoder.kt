@@ -347,6 +347,124 @@ private fun poiNormDenom(vtxData: ByteArray): Long {
     return ((1L shl bs.read(6)) - 1L).coerceAtLeast(1L)
 }
 
+// ─── Modern building footprints (geo_codec_readModernBuildings, chapter 0x68) ──
+// Format (from decompile, byte-exact, no guessing needed):
+//   1. decodeSectionEncoding: a generic ranges+deltas vertex-pool header+body.
+//      Buildings only need vertexCount/coordPrecision from its header — the
+//      pool's own vertex data is NOT the building geometry, but MUST be
+//      consumed bit-for-bit to keep the cursor aligned.
+//   2. auxWidth(5)+1 -> auxMarker(auxWidth) -> hasAuxRecords = marker != 0
+//   3. featureCountWidth(5)+1 -> featureCount(featureCountWidth), cap 0x10000
+//   4. 5x 4-bit widths: auxRecordCountWidth, xValueWidth, yValueWidth,
+//      vertexCountWidth, auxRecordValueWidth
+//   5. 4x 1-bit flags: hasXValues, hasYValues, hasFeatureFlag, hasFeatureId
+//   6. Per feature: optional aux records (skipped), vertexCount(vertexCountWidth),
+//      x values (vertexCount x xValueWidth, raw/coordScale), y values (vertexCount x
+//      [1-bit present + yValueWidth if present], raw/coordScale), optional 1-bit
+//      flag, optional 1-bit id-present + 64-bit id.
+// No trailing style-attribute decode needed — this chapter's bytes are already
+// isolated by VMP4's own section framing, so we can stop once geometry is read.
+
+private fun readVarWidth5(bs: BitReader): Int {
+    val w = bs.read(5) + 1
+    return bs.read(w)
+}
+
+private data class SectionVertexPoolHeader(val vertexCount: Int, val coordPrecision: Int)
+
+private fun decodeSectionEncodingConsume(bs: BitReader): SectionVertexPoolHeader {
+    val rangeCount = readVarWidth5(bs)
+    val vertexCount = readVarWidth5(bs)
+    val coordPrecision = bs.read(5)
+    val pointCountBitCount = bs.read(5)
+    val deltaBitCountBitCount = bs.read(4)
+    val coordBitCount = bs.read(5)
+    val curveFlag = bs.read(1) == 1
+    if (vertexCount > 0 && rangeCount > 0) {
+        var vertexIndex = 0
+        repeat(rangeCount) {
+            if (vertexIndex >= vertexCount) return@repeat
+            bs.readSigned(coordBitCount) // range base x (discarded)
+            bs.readSigned(coordBitCount) // range base y (discarded)
+            vertexIndex++
+            val additionalPointCount = bs.read(pointCountBitCount)
+            val deltaBitCount = bs.read(deltaBitCountBitCount)
+            repeat(additionalPointCount) {
+                bs.readSigned(deltaBitCount) // dx (discarded)
+                bs.readSigned(deltaBitCount) // dy (discarded)
+                vertexIndex++
+                if (curveFlag) bs.read(1)
+            }
+        }
+    }
+    return SectionVertexPoolHeader(vertexCount, coordPrecision)
+}
+
+private fun decodeModernBuildings(
+    ch: ByteArray, tileX: Int, tileY: Int, tileZ: Int,
+): List<VectorTileFeature> {
+    val bs = BitReader(ch, 0)
+    val vph = decodeSectionEncodingConsume(bs)
+
+    val auxWidth = bs.read(5) + 1
+    val auxMarker = bs.read(auxWidth)
+    val hasAuxRecords = auxMarker != 0
+
+    val featureCountWidth = bs.read(5) + 1
+    val featureCount = bs.read(featureCountWidth)
+    if (featureCount >= 0x10000) return emptyList()
+
+    val auxRecordCountWidth = bs.read(4)
+    val xValueWidth = bs.read(4)
+    val yValueWidth = bs.read(4)
+    val vertexCountWidth = bs.read(4)
+    val auxRecordValueWidth = bs.read(4)
+    val hasXValues = bs.read(1) == 1
+    val hasYValues = bs.read(1) == 1
+    val hasFeatureFlag = bs.read(1) == 1
+    val hasFeatureId = bs.read(1) == 1
+
+    val coordScale = ((1L shl vph.coordPrecision) - 1L).toDouble().coerceAtLeast(1.0)
+    val feats = mutableListOf<VectorTileFeature>()
+    try {
+        for (i in 0 until featureCount) {
+            if (hasAuxRecords) {
+                val auxCount = bs.read(auxRecordCountWidth)
+                repeat(auxCount) { bs.read(auxRecordValueWidth) }
+            }
+            val vertexCount = bs.read(vertexCountWidth)
+            val xs = DoubleArray(vertexCount)
+            val ys = DoubleArray(vertexCount)
+            if (hasXValues) {
+                for (j in 0 until vertexCount) xs[j] = bs.read(xValueWidth).toDouble() / coordScale
+            }
+            if (hasYValues) {
+                for (j in 0 until vertexCount) {
+                    val present = bs.read(1) == 1
+                    val v = if (present) bs.read(yValueWidth) else 0
+                    ys[j] = v.toDouble() / coordScale
+                }
+            }
+            if (hasFeatureFlag) bs.read(1)
+            if (hasFeatureId) {
+                val idPresent = bs.read(1) == 1
+                if (idPresent) { bs.read(32); bs.read(32) } // skip 64-bit id
+            }
+            if (vertexCount >= 3) {
+                // Building y uses the same inverted convention as POI (verified
+                // empirically below) — not the raw polygon/line convention.
+                val ring = (0 until vertexCount).map { k ->
+                    tileNormToLatLon(tileX, tileY, tileZ, xs[k], 1.0 - ys[k])
+                }
+                feats.add(VectorTileFeature(FeatureType.BUILDING, listOf(ring), emptyList(), emptyList()))
+            }
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Building decode error at feature ${feats.size}/$featureCount: ${e.message}")
+    }
+    return feats
+}
+
 // ─── Line feature decoder (_readLines) ───────────────────────────────────────
 
 private fun decodeLineFeatures(
@@ -682,8 +800,13 @@ fun decodeVmp4Tile(data: ByteArray, tileZ: Int, tileX: Int, tileY: Int): VectorT
     val hasModernBuildings = byType[CH_MODERN_BUILDINGS_VADDR] != null
     if (hasModernBuildings) {
         // Modern buildings chapter (0x68) present — skip legacy water/park path
-        // TODO: decode 0x68 modern buildings when format is understood
-        Log.d(TAG, "Modern buildings chapter 0x68 present (skipping legacy 0x21)")
+        byType[CH_MODERN_BUILDINGS_VADDR]?.firstOrNull()?.let { ch ->
+            try {
+                val feats = decodeModernBuildings(ch, tileX, tileY, tileZ)
+                if (feats.isNotEmpty()) polygonFeatures[CH_MODERN_BUILDINGS_VADDR] = feats
+                Log.d(TAG, "Modern buildings 0x68: ${feats.size} features")
+            } catch (e: Exception) { Log.w(TAG, "Poly[0x68] decode error: $e") }
+        }
     } else {
         // Legacy path: 0x21 = water + park polygons
         byType[CH_POLY_LEGACY_WATER_PARK]?.firstOrNull()?.let { ch ->

@@ -199,6 +199,15 @@ class NativeMapView(private val context: Context,
                 ).withFilter(
                     Expression.raw("""["<",["get","am"],20000]""")
                 ))
+                // Native modern buildings (chapter 0x68) — real Apple footprint decode
+                style.addLayer(FillLayer("l-building-vmp4", SRC_POLY).withProperties(
+                    PropertyFactory.fillColor("#E2D8CE"),
+                    PropertyFactory.fillOpacity(0.9f),
+                    PropertyFactory.fillOutlineColor("#B0A89C"),
+                    PropertyFactory.fillAntialias(true),
+                ).withFilter(
+                    Expression.raw("""["==",["get","ch"],104]""")  // 0x68 = modern buildings chapter
+                ))
                 // Known detected VMP4 types (when ft is correctly decoded) get more contrast
                 style.addLayer(FillLayer("l-building-detected", SRC_POLY).withProperties(
                     PropertyFactory.fillColor("#E2D9CE"),
