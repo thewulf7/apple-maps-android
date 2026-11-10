@@ -367,21 +367,27 @@ class NativeMapView(private val context: Context,
                     PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 ).withFilter(Expression.raw("""["in",["get","highway"],["literal",["service","living_street"]]]""")))
                 // VMP4 fallback roads — used when OSM fetch fails/times out (any location).
-                // VMP4 lines carry highway:"road" (no class info) — single neutral style.
-                style.addLayer(LineLayer("l-road-vmp4-case", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#94907F"),  // VectorKit road-casing
-                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
-                        Expression.stop(13, 2.5f), Expression.stop(15, 6f), Expression.stop(17, 10f))),
-                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                ).withFilter(Expression.raw("""["==",["get","highway"],"road"]""")))
-                style.addLayer(LineLayer("l-road-vmp4-fill", SRC_LINE).withProperties(
-                    PropertyFactory.lineColor("#FFFEF5"),  // VectorKit warm road fill
-                    PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
-                        Expression.stop(13, 1f), Expression.stop(15, 3.5f), Expression.stop(17, 6f))),
-                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                ).withFilter(Expression.raw("""["==",["get","highway"],"road"]""")))
+                // cls = native heuristic from shield/label presence: major (shielded,
+                // i.e. trunk/motorway), named (arterial), minor (anonymous).
+                // One case+fill pair per class: mbgl forbids nested zoom expressions,
+                // so per-class widths need separate layers with top-level interpolate.
+                for ((clsId, cw, fw) in listOf(
+                        Triple("minor", 3f, 1.8f), Triple("named", 5.5f, 3.3f), Triple("major", 10f, 6f))) {
+                    style.addLayer(LineLayer("l-road-vmp4-case-$clsId", SRC_LINE).withProperties(
+                        PropertyFactory.lineColor("#94907F"),  // VectorKit road-casing
+                        PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                            Expression.stop(13, cw * 0.25f), Expression.stop(15, cw * 0.6f), Expression.stop(17, cw))),
+                        PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                        PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                    ).withFilter(Expression.raw("""["all",["==",["get","highway"],"road"],["==",["get","cls"],"$clsId"]]""")))
+                    style.addLayer(LineLayer("l-road-vmp4-fill-$clsId", SRC_LINE).withProperties(
+                        PropertyFactory.lineColor("#FFFEF5"),  // VectorKit warm road fill
+                        PropertyFactory.lineWidth(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                            Expression.stop(13, fw * 0.28f), Expression.stop(15, fw * 0.58f), Expression.stop(17, fw))),
+                        PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                        PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                    ).withFilter(Expression.raw("""["all",["==",["get","highway"],"road"],["==",["get","cls"],"$clsId"]]""")))
+                }
                 // Road name labels — crisp, Apple Maps style with strong halos
                 style.addLayer(SymbolLayer("l-label-road-major", SRC_LINE).withProperties(
                     PropertyFactory.textField(Expression.get("name")),

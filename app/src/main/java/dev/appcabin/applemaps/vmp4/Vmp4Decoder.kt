@@ -721,7 +721,15 @@ fun VectorTile.toGeoJson(): Pair<String, String> {
                 appendCoord(lineSb, ll)
             }
             lineSb.append("""]},""")
-            lineSb.append(""""properties":{"ft":$ftTag,"label":"${label.jsonStr()}","shield":"${shieldText.jsonStr()}","highway":"road"}}""")
+            // Native road-class heuristic (no OSM needed): shielded roads are
+            // trunk/motorway/primary by Apple's own labeling rules; named but
+            // unshielded = secondary/tertiary; anonymous = minor.
+            val cls = when {
+                shieldText.isNotEmpty() -> "major"
+                label.isNotEmpty() -> "named"
+                else -> "minor"
+            }
+            lineSb.append(""""properties":{"ft":$ftTag,"label":"${label.jsonStr()}","shield":"${shieldText.jsonStr()}","cls":"$cls","highway":"road"}}""")
         }
     }
     lineSb.append("]}")
