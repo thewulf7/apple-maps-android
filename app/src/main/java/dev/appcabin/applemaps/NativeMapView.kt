@@ -422,13 +422,28 @@ class NativeMapView(private val context: Context,
                     PropertyFactory.textAllowOverlap(false),
                     PropertyFactory.textFont(arrayOf("Open Sans Regular", "Arial Unicode MS Regular")),
                 ).withFilter(Expression.raw("""["all",["has","name"],["in",["get","highway"],["literal",["tertiary","residential","unclassified","living_street"]]]]""")))
+                // Native Apple road names on VMP4 fallback lines (style-20, no OSM)
+                style.addLayer(SymbolLayer("l-label-road-vmp4", SRC_LINE).withProperties(
+                    PropertyFactory.textField(Expression.get("label")),
+                    PropertyFactory.textSize(Expression.interpolate(Expression.linear(), Expression.zoom(),
+                        Expression.stop(13, 8.5f), Expression.stop(15, 10f), Expression.stop(17, 12f))),
+                    PropertyFactory.textColor("#4A463E"),
+                    PropertyFactory.textHaloColor("#FFFEF9"),
+                    PropertyFactory.textHaloWidth(2.5f),
+                    PropertyFactory.symbolPlacement("line"),
+                    PropertyFactory.symbolSpacing(240.0f),
+                    PropertyFactory.textMaxAngle(30.0f),
+                    PropertyFactory.textOptional(true),
+                    PropertyFactory.textAllowOverlap(false),
+                    PropertyFactory.textFont(arrayOf("Open Sans Regular", "Arial Unicode MS Regular")),
+                ).withFilter(Expression.raw("""["all",["==",["get","highway"],"road"],["has","label"],["!=" ,["get","label"],""]]""")))
                 // Native Apple POI labels (chapter 0x1e, style-13 tiles)
                 style.addLayer(SymbolLayer("l-poi-apple", SRC_POINT).withProperties(
                     PropertyFactory.textField(Expression.get("label")),
                     PropertyFactory.textSize(Expression.interpolate(Expression.linear(), Expression.zoom(),
                         Expression.stop(13, 10.5f), Expression.stop(15, 12.5f), Expression.stop(17, 14f))),
                     PropertyFactory.textColor("#3A3A3C"),
-                    PropertyFactory.textHaloColor("#FFFFFFCC"),
+                    PropertyFactory.textHaloColor("rgba(255,255,255,0.8)"),
                     PropertyFactory.textHaloWidth(1.4f),
                     PropertyFactory.textOffset(arrayOf(0f, -0.9f)),
                     PropertyFactory.textAllowOverlap(false),
