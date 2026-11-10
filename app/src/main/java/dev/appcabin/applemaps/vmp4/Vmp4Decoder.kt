@@ -18,6 +18,7 @@ data class VectorTileFeature(
     val geometry: List<List<LatLon>>, // one inner list per polyline/polygon ring
     val labels: List<String>,
     val shields: List<Pair<String, Long>>, // (text, identifier)
+    val roadWidth: Int = 0,          // native stroke width from chapter 0x33 (tile-relative)
 )
 
 data class VectorTile(
@@ -707,6 +708,15 @@ fun VectorTile.toGeoJson(): Pair<String, String> {
     polySb.append("]}")
 
     // Lines — road network
+    // Native class from Apple's own stroke widths (chapter 0x33). Widths are encoded
+    // against the tile vertex grid, so absolute scale varies per tile/zoom; classify
+    // by percentile rank within the tile's width distribution. Fall back to the
+    // shield/label heuristic when 0x33 is absent or all-zero (e.g. z13 tiles).
+    val wSorted = lineFeatures.map { it.roadWidth }.filter { it > 0 }.sorted()
+    val hasWidths = wSorted.isNotEmpty()
+    fun widthRank(w: Int): Double =
+        if (!hasWidths || w <= 0) -1.0 else java.util.Collections.binarySearch(
+            wSorted, w).let { idx -> (if (idx < 0) -idx - 1 else idx).toDouble() / (wSorted.size - 1).coerceAtLeast(1) }
     for (feat in lineFeatures) {
         if (feat.geometry.isEmpty()) continue
         for (ring in feat.geometry) {
@@ -721,13 +731,11 @@ fun VectorTile.toGeoJson(): Pair<String, String> {
                 appendCoord(lineSb, ll)
             }
             lineSb.append("""]},""")
-            // Native road-class heuristic (no OSM needed): shielded roads are
-            // trunk/motorway/primary by Apple's own labeling rules; named but
-            // unshielded = secondary/tertiary; anonymous = minor.
+            val rank = widthRank(feat.roadWidth)
             val cls = when {
-                shieldText.isNotEmpty() -> "major"
-                label.isNotEmpty() -> "named"
-                else -> "minor"
+                rank >= 0.85 || shieldText.isNotEmpty() -> "major"
+                rank >= 0.45 || label.isNotEmpty()      -> "named"
+                else                                    -> "minor"
             }
             lineSb.append(""""properties":{"ft":$ftTag,"label":"${label.jsonStr()}","shield":"${shieldText.jsonStr()}","cls":"$cls","highway":"road"}}""")
         }
@@ -769,6 +777,54 @@ private fun String.jsonStr(): String {
     return sb.toString()
 }
 
+// ─── Chapter 0x33: characteristic points (road stroke widths) ────────────────
+// Format (verified bit-exact on 7 cities, v113): zlib body after uncompressed
+// prefix. Header: varint strokeSpecCount(=65535 sentinel), pointCount, runCount.
+// Then runCount runs of (characteristicId varint, runLength varint); per point:
+//   styleIndex varint; f = rawFlags byte PEEKED at cursor, then TWO bytes consumed
+//   (10-bit flag sync: 3 condition bits + 7 field bits span bytes P and P+1);
+//   conditions read AFTER the 2-byte advance: bit7 inherit-varint, bit6 d0-varint,
+//   bit5 float-varint; bit4 strokeWidth varint; bit3 colorData (nb,nh then
+//   2*(nb+nh) varints). Runs align 1:1 with 0x1f roadFeatureCount.
+private fun decodeRoadCharacteristics(body: ByteArray): IntArray {
+    var pos = 0
+    val (_, p1) = readVarUint32(body, pos); pos = p1          // strokeSpecCount (sentinel)
+    val (pointCount, p2) = readVarUint32(body, pos); pos = p2
+    val (runCount, p3) = readVarUint32(body, pos); pos = p3
+    if (pointCount > 200_000L || runCount > 200_000L) return IntArray(0)
+    val widths = IntArray(runCount.toInt())
+    for (r in 0 until runCount.toInt()) {
+        if (pos >= body.size) break
+        val (_, pa) = readVarUint32(body, pos); pos = pa      // characteristicId
+        val (runLen, pb) = readVarUint32(body, pos); pos = pb
+        var maxW = 0
+        repeat(runLen.toInt()) {
+            if (pos + 2 >= body.size) return@repeat
+            val (_, pc) = readVarUint32(body, pos); pos = pc  // styleIndex
+            val f = body[pos].toInt() and 0xff
+            pos += 2                                          // 10-bit flag sync
+            if (f and 0x80 != 0) { val (_, pd) = readVarUint32(body, pos); pos = pd }
+            if (f and 0x40 != 0) { val (_, pe) = readVarUint32(body, pos); pos = pe }
+            if (f and 0x20 != 0) { val (_, pf) = readVarUint32(body, pos); pos = pf }
+            if (f and 0x10 != 0) {
+                val (w, pg) = readVarUint32(body, pos); pos = pg
+                if (w > maxW) maxW = w.toInt()
+            }
+            if (f and 0x08 != 0) {
+                val (nb, ph) = readVarUint32(body, pos); pos = ph
+                val (nh, pi) = readVarUint32(body, pos); pos = pi
+                if (nb > 64 || nh > 64) return@repeat
+                repeat(nb.toInt() + nh.toInt()) {
+                    val (_, pk) = readVarUint32(body, pos); pos = pk
+                    val (_, pl) = readVarUint32(body, pos); pos = pl
+                }
+            }
+        }
+        widths[r] = maxW
+    }
+    return widths
+}
+
 fun decodeVmp4Tile(data: ByteArray, tileZ: Int, tileX: Int, tileY: Int): VectorTile {
     val sections = parseSections(data)
 
@@ -787,10 +843,25 @@ fun decodeVmp4Tile(data: ByteArray, tileZ: Int, tileX: Int, tileY: Int): VectorT
     val vtxChapters: List<ByteArray> = sections.filter { it.type == CH_VERTICES }.map { it.data }
 
     // Line features (roads)
-    val lineFeatures = byType[CH_LINE_FEATURES]?.firstOrNull()?.let { ch ->
+    val lineFeaturesRaw = byType[CH_LINE_FEATURES]?.firstOrNull()?.let { ch ->
         try { decodeLineFeatures(ch, vtxByIndex, stringPool, tileX, tileY, tileZ) }
         catch (e: Exception) { Log.w(TAG, "Line decode error: $e"); emptyList() }
     } ?: emptyList()
+
+    // Native road stroke widths (chapter 0x33) join 1:1 by run index with
+    // roadFeatureCount; attach to features so class can use Apple's own data.
+    val lineFeatures = byType[CH_POLY_CHAR_LINE]?.firstOrNull()?.let { ch ->
+        try {
+            val widths = decodeRoadCharacteristics(ch)
+            if (widths.isNotEmpty() && widths.size == lineFeaturesRaw.size) {
+                Log.d(TAG, "Road characteristics 0x33: ${widths.size} widths joined")
+                lineFeaturesRaw.mapIndexed { i, f -> f.copy(roadWidth = widths[i]) }
+            } else {
+                if (widths.isNotEmpty()) Log.w(TAG, "0x33 runs=${widths.size} != lines=${lineFeaturesRaw.size}; widths dropped")
+                lineFeaturesRaw
+            }
+        } catch (e: Exception) { Log.w(TAG, "0x33 decode error: $e"); lineFeaturesRaw }
+    } ?: lineFeaturesRaw
 
     // Polygon features — mirroring geo_codec__readPolygons logic (confirmed from decompile):
     // 1. Always decode 0x20 (land + all area features)
